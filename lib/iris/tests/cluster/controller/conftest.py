@@ -299,6 +299,7 @@ def worker_daemon_backends_for_prune(state: ControllerTestState) -> list[FakePro
     provider.health = state._health
     provider.bind_runtime(
         BackendRuntime(
+            backend_id=DEFAULT_BACKEND_ID,
             db=state._db,
             endpoints=state._endpoints,
             run_template_cache=state._run_template_cache,
