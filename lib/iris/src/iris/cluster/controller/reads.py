@@ -36,6 +36,9 @@ from iris.cluster.controller.reconcile.policy import NON_TERMINAL_TASK_STATES
 from iris.cluster.controller.reconcile.worker import ReconcileRow
 from iris.cluster.controller.schema import (
     USER_ROLE_DEFAULT,
+    federated_jobs_table,
+    federation_changelog_table,
+    federation_sync_state_table,
     hint_rare_state,
     job_config_table,
     job_workdir_files_table,
@@ -56,7 +59,8 @@ from iris.cluster.controller.task_state import (
     task_row_can_be_scheduled,
 )
 from iris.cluster.controller.worker_health import WorkerHealthTracker
-from iris.cluster.types import AttemptUid, JobName, PendingTask, WorkerId, WorkerUsability
+from iris.cluster.federation.store import FederationDirection, HandoffState
+from iris.cluster.types import TERMINAL_JOB_STATES, AttemptUid, JobName, PendingTask, WorkerId, WorkerUsability
 from iris.rpc import controller_pb2, job_pb2
 
 # ---------------------------------------------------------------------------
@@ -1648,3 +1652,214 @@ def load_control_snapshot(
         reconcile_rows=reconcile_rows,
         timeout_rows=timeout_rows,
     )
+
+
+# ---------------------------------------------------------------------------
+# Federation (parent side: handles; peer side: the change-log sync page)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FederatedHandle:
+    """A parent-side SENT federated job handle (``federated_jobs`` ⋈ ``jobs``)."""
+
+    job_id: JobName  # this cluster's local (root) job id
+    peer_id: str
+    remote_job_id: str
+    owner_principal: str
+    handoff_state: int
+    cancel_intent_version: int
+
+
+_SENT_HANDLE_COLUMNS = (
+    federated_jobs_table.c.job_id,
+    federated_jobs_table.c.peer_id,
+    federated_jobs_table.c.remote_job_id,
+    federated_jobs_table.c.owner_principal,
+    federated_jobs_table.c.handoff_state,
+    federated_jobs_table.c.cancel_intent_version,
+)
+
+
+def _sent_handle(row) -> FederatedHandle:
+    return FederatedHandle(
+        job_id=row.job_id,
+        peer_id=row.peer_id,
+        remote_job_id=row.remote_job_id,
+        owner_principal=row.owner_principal,
+        handoff_state=int(row.handoff_state),
+        cancel_intent_version=int(row.cancel_intent_version),
+    )
+
+
+def federated_handle(tx: Tx, job_id: JobName) -> FederatedHandle | None:
+    """The SENT federated handle for ``job_id``, or ``None`` if it is not one.
+
+    Restricted to SENT rows: a RECEIVED row (this cluster is the peer) runs as an
+    ordinary local job, so it is not a handle a parent-side cancel routes through.
+    """
+    row = tx.execute(
+        select(*_SENT_HANDLE_COLUMNS).where(
+            federated_jobs_table.c.job_id == job_id,
+            federated_jobs_table.c.direction == int(FederationDirection.SENT),
+        )
+    ).first()
+    return _sent_handle(row) if row is not None else None
+
+
+def pending_handoff_handles(tx: Tx) -> list[FederatedHandle]:
+    """SENT handles still awaiting delivery: ``PENDING_HANDOFF`` and not cancelled.
+
+    A cancelled pending handoff (``cancel_intent_version > 0``) is excluded so the
+    retry loop never delivers a job the user already asked to cancel.
+    """
+    rows = tx.execute(
+        select(*_SENT_HANDLE_COLUMNS).where(
+            federated_jobs_table.c.direction == int(FederationDirection.SENT),
+            federated_jobs_table.c.handoff_state == bindparam("pending_state"),
+            federated_jobs_table.c.cancel_intent_version == 0,
+        ),
+        {"pending_state": int(HandoffState.PENDING_HANDOFF)},
+    ).all()
+    return [_sent_handle(r) for r in rows]
+
+
+def pending_cancel_handles(tx: Tx) -> list[FederatedHandle]:
+    """SENT handles with a cancel intent set whose local mirrored job is not terminal.
+
+    These are the routed ``TerminateJob`` targets the sync loop re-drives until the
+    peer acks or sync mirrors the job terminal/pruned.
+    """
+    rows = tx.execute(
+        select(*_SENT_HANDLE_COLUMNS)
+        .select_from(federated_jobs_table.join(jobs_table, jobs_table.c.job_id == federated_jobs_table.c.job_id))
+        .where(
+            federated_jobs_table.c.direction == int(FederationDirection.SENT),
+            federated_jobs_table.c.cancel_intent_version > 0,
+            jobs_table.c.state.notin_(bindparam("terminal_states", expanding=True)),
+        ),
+        {"terminal_states": list(TERMINAL_JOB_STATES)},
+    ).all()
+    return [_sent_handle(r) for r in rows]
+
+
+def federated_job_for_remote_id(tx: Tx, peer_id: str, remote_job_id: str) -> JobName | None:
+    """The local SENT job id for a peer's ``remote_job_id`` handle, or ``None``."""
+    row = tx.execute(
+        select(federated_jobs_table.c.job_id).where(
+            federated_jobs_table.c.direction == int(FederationDirection.SENT),
+            federated_jobs_table.c.peer_id == peer_id,
+            federated_jobs_table.c.remote_job_id == remote_job_id,
+        )
+    ).first()
+    return row.job_id if row is not None else None
+
+
+def federated_handles_for_peer(tx: Tx, peer_id: str) -> dict[str, JobName]:
+    """``{remote_job_id: local_job_id}`` for every *handed-off* SENT handle to ``peer_id``.
+
+    Restricted to ``HANDED_OFF`` handles: a still-``PENDING_HANDOFF`` handle is not
+    on the peer yet (the re-drive owns it), so its absence from the peer's active
+    set is expected — a full resync must not reap it.
+    """
+    rows = tx.execute(
+        select(federated_jobs_table.c.remote_job_id, federated_jobs_table.c.job_id).where(
+            federated_jobs_table.c.direction == int(FederationDirection.SENT),
+            federated_jobs_table.c.peer_id == peer_id,
+            federated_jobs_table.c.handoff_state == bindparam("handed_off"),
+        ),
+        {"handed_off": int(HandoffState.HANDED_OFF)},
+    ).all()
+    return {r.remote_job_id: r.job_id for r in rows}
+
+
+def active_federated_job_count(tx: Tx, peer_id: str) -> int:
+    """Count of non-terminal SENT federated handles delegated to ``peer_id``."""
+    count = tx.execute(
+        select(func.count())
+        .select_from(federated_jobs_table.join(jobs_table, jobs_table.c.job_id == federated_jobs_table.c.job_id))
+        .where(
+            federated_jobs_table.c.direction == int(FederationDirection.SENT),
+            federated_jobs_table.c.peer_id == bindparam("peer_id"),
+            jobs_table.c.state.notin_(bindparam("terminal_states", expanding=True)),
+        ),
+        {"peer_id": peer_id, "terminal_states": list(TERMINAL_JOB_STATES)},
+    ).scalar()
+    return int(count or 0)
+
+
+def read_sync_cursor(tx: Tx, peer_id: str) -> str:
+    """The persisted delta-sync cursor for ``peer_id`` ("" on first contact)."""
+    row = tx.execute(
+        select(federation_sync_state_table.c.cursor).where(federation_sync_state_table.c.peer_id == peer_id)
+    ).first()
+    return row.cursor if row is not None else ""
+
+
+# --- peer side: row-shaped changelog reads (the sync page is assembled in the
+#     service, which needs the current job/task state to build each delta) ---
+
+
+@dataclass(frozen=True)
+class ChangelogRow:
+    """One raw ``federation_changelog`` row for a requester."""
+
+    job_id: JobName  # the peer's local job id (== the requester's remote_job_id)
+    task_index: int | None  # None = a job-level change ("all tasks")
+    tombstone: bool
+    seq: int
+
+
+def changelog_max_seq(tx: Tx) -> int:
+    """The highest changelog ``seq`` written, or 0 when the changelog is empty."""
+    return int(tx.execute(select(func.coalesce(func.max(federation_changelog_table.c.seq), 0))).scalar() or 0)
+
+
+def changelog_min_seq(tx: Tx) -> int:
+    """The lowest changelog ``seq`` retained, or 0 when the changelog is empty."""
+    return int(tx.execute(select(func.coalesce(func.min(federation_changelog_table.c.seq), 0))).scalar() or 0)
+
+
+def active_received_jobs(tx: Tx, requester_id: str) -> list[JobName]:
+    """Every still-present job this peer received from ``requester_id`` (the full set
+    a stale/first-contact requester is resynced with)."""
+    rows = tx.execute(
+        select(federated_jobs_table.c.job_id)
+        .select_from(federated_jobs_table.join(jobs_table, jobs_table.c.job_id == federated_jobs_table.c.job_id))
+        .where(
+            federated_jobs_table.c.direction == int(FederationDirection.RECEIVED),
+            federated_jobs_table.c.peer_id == requester_id,
+        )
+    ).all()
+    return [r.job_id for r in rows]
+
+
+def changelog_rows_since(tx: Tx, requester_id: str, cursor_seq: int) -> list[ChangelogRow]:
+    """Every changelog row for ``requester_id`` past ``cursor_seq``, in ``seq`` order.
+
+    Attribution is join-free: each row carries its ``requester_id``, so a tombstone
+    is reported even after its job (and any RECEIVED handle) is deleted.
+    """
+    rows = tx.execute(
+        select(
+            federation_changelog_table.c.job_id,
+            federation_changelog_table.c.task_index,
+            federation_changelog_table.c.tombstone,
+            federation_changelog_table.c.seq,
+        )
+        .where(
+            federation_changelog_table.c.requester_id == requester_id,
+            federation_changelog_table.c.seq > bindparam("cursor_seq"),
+        )
+        .order_by(federation_changelog_table.c.seq),
+        {"cursor_seq": cursor_seq},
+    ).all()
+    return [
+        ChangelogRow(
+            job_id=r.job_id,
+            task_index=int(r.task_index) if r.task_index is not None else None,
+            tombstone=bool(r.tombstone),
+            seq=int(r.seq),
+        )
+        for r in rows
+    ]
