@@ -33,7 +33,7 @@ from iris.cluster.federation.store import (
     HandoffAdmission,
     HandoffSpec,
 )
-from iris.cluster.types import JobName
+from iris.cluster.types import JobName, TaskAttempt
 from iris.managed_thread import ManagedThread, ThreadContainer
 from iris.rpc import controller_pb2, job_pb2
 
@@ -47,21 +47,31 @@ _PEER_RPC_ERRORS = (ConnectError, ConnectionError, OSError)
 
 
 def encode_remote_job_id(cluster_id: str, parent_job_id: JobName) -> str:
-    """The deterministic, globally-unique job id a peer runs a handoff under.
+    """The deterministic, globally-unique wire id a peer runs a handoff under:
+    ``parent_job_id``'s root folded under ``cluster_id`` (``/<user>/<cluster>~<name>``)."""
+    return JobName.federated_remote_root(cluster_id, parent_job_id.root_job).to_wire()
 
-    Folds this cluster's id into the root job-name component, keeping a valid
-    two-component root ``JobName`` (``/<user>/<cluster>~<name>``): globally unique
-    because ``cluster_id`` is, deterministic so a re-sent handoff is a same-name
-    submit the peer's KEEP policy dedups, and a legal name component (a name may
-    not contain ``/``). Ownership is never parsed back out of it — the peer reads
-    it from the explicit ``FederationHandoff`` field.
+
+def _rebase_task_id(task_id: str, remote_job_id: str) -> str:
+    """Rewrite a full task wire id (``/user/job/0``) onto ``remote_job_id``'s root job,
+    preserving the child path and task index."""
+    remote_root = JobName.from_wire(remote_job_id)
+    # Parse as a JobName, not a TaskAttempt: a ':' is legal in a job-name component,
+    # and TaskAttempt.from_wire would mis-split it as an attempt qualifier.
+    return JobName.from_wire(task_id).with_root_job(remote_root).to_wire()
+
+
+def _rebase_profile_target(target: str, remote_job_id: str) -> str:
+    """Rewrite a profile ``target`` onto the peer's ``remote_job_id`` root job.
+
+    ``target`` is a :class:`~iris.cluster.types.TaskAttempt` wire string — a task id
+    with an optional ``:attempt`` qualifier — so the root job is replaced while the
+    child path, task index, and any attempt qualifier are preserved.
     """
-    if not cluster_id:
-        raise ValueError("federation cluster_id is required to hand a job off")
-    if "~" in cluster_id:
-        raise ValueError(f"federation cluster_id must not contain '~' (got {cluster_id!r})")
-    root = parent_job_id.root_job
-    return JobName.root(root.user, f"{cluster_id}~{root.name}").to_wire()
+    parsed = TaskAttempt.from_wire(target)
+    remote_root = JobName.from_wire(remote_job_id)
+    rebased = TaskAttempt(task_id=parsed.task_id.with_root_job(remote_root), attempt_id=parsed.attempt_id)
+    return rebased.to_wire()
 
 
 class FederationManager:
@@ -147,9 +157,7 @@ class FederationManager:
         """
         if self._store is None:
             raise RuntimeError("federation handoff requires a store")
-        peer = self._peers.get(peer_id)
-        if peer is None:
-            raise ValueError(f"unknown federation peer {peer_id!r}")
+        self._require_peer(peer_id)
 
         remote_job_id = encode_remote_job_id(self._cluster_id, parent_job_id)
         spec = HandoffSpec(
@@ -213,7 +221,57 @@ class FederationManager:
                 exc,
             )
 
+    # -- on-demand proxy (parent side) ---------------------------------------
+
+    def proxy_profile(
+        self,
+        *,
+        peer_id: str,
+        remote_job_id: str,
+        request: job_pb2.ProfileTaskRequest,
+    ) -> job_pb2.ProfileTaskResponse:
+        """Forward a profile RPC for a federated task to its peer controller.
+
+        Rewrites the request's target onto the peer's remote root job (preserving
+        the task index and any attempt qualifier) so the peer resolves the same
+        task in its own tree, then proxies to the peer's ``ProfileTask``. The peer
+        is authoritative: its answer — including a ``NOT_FOUND`` for a task it has
+        since moved or finished — propagates back verbatim.
+        """
+        peer = self._require_peer(peer_id)
+        forwarded = job_pb2.ProfileTaskRequest()
+        forwarded.CopyFrom(request)
+        forwarded.target = _rebase_profile_target(request.target, remote_job_id)
+        return peer.profile_task(forwarded)
+
+    def proxy_exec(
+        self,
+        *,
+        peer_id: str,
+        remote_job_id: str,
+        request: controller_pb2.Controller.ExecInContainerRequest,
+    ) -> controller_pb2.Controller.ExecInContainerResponse:
+        """Forward an exec RPC for a federated task to its peer controller.
+
+        Rewrites the request's task id onto the peer's remote root job (preserving
+        the task index) so the peer resolves the same task in its own tree, then
+        proxies to the peer's ``ExecInContainer``. The peer is authoritative: its
+        answer — including a ``NOT_FOUND`` — propagates back verbatim.
+        """
+        peer = self._require_peer(peer_id)
+        forwarded = controller_pb2.Controller.ExecInContainerRequest()
+        forwarded.CopyFrom(request)
+        forwarded.task_id = _rebase_task_id(request.task_id, remote_job_id)
+        return peer.exec_in_container(forwarded)
+
     # -- background loops ----------------------------------------------------
+
+    def _require_peer(self, peer_id: str) -> FederationPeer:
+        """The configured peer named ``peer_id``, or raise if it is unknown."""
+        peer = self._peers.get(peer_id)
+        if peer is None:
+            raise ValueError(f"unknown federation peer {peer_id!r}")
+        return peer
 
     def _run_loop(self, stop_event: threading.Event, step: Callable[[], None], interval: float) -> None:
         """Run ``step`` every ``interval`` seconds until ``stop_event`` is set."""

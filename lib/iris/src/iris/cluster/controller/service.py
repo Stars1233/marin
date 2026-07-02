@@ -87,6 +87,7 @@ from iris.cluster.runtime.profile import (
     profile_local_process,
 )
 from iris.cluster.types import (
+    FEDERATION_DELIMITER,
     TERMINAL_JOB_STATES,
     TERMINAL_TASK_STATES,
     JobName,
@@ -1157,6 +1158,18 @@ class ControllerServiceImpl:
 
         job_id = JobName.from_wire(request.name)
 
+        # '~' is reserved as the federation cluster-dispatch delimiter (it joins a
+        # cluster id to a root name in a handed-off job's remote id), so a user may
+        # not name a job with it — that would be ambiguous with a handed-off root.
+        # Only the job's own leaf name is checked, so a child spawned on a peer under
+        # a '~'-bearing federated root is fine; a received handoff, whose root name IS
+        # the encoded cluster~name, is exempt.
+        if FEDERATION_DELIMITER in job_id.name and not request.HasField("federation"):
+            raise ConnectError(
+                Code.INVALID_ARGUMENT,
+                f"Job name {job_id.name!r} may not contain {FEDERATION_DELIMITER!r} (reserved for federation).",
+            )
+
         # Reject root RPC submissions from stale clients. Direct in-process
         # calls have no wire client; tests and harnesses use ctx=None.
         # Nested submissions are exempt because they come from an already
@@ -2115,6 +2128,12 @@ class ControllerServiceImpl:
         empty or unknown — the single-backend case and any pre-routing rows."""
         return self._controller.backends.get(backend_id) or self._controller.provider
 
+    def _federated_handle_for_task(self, task_id: JobName) -> reads.FederatedHandle | None:
+        """The SENT federated handle owning ``task_id``'s root job, or ``None`` if
+        that root job runs locally."""
+        with self._db.read_snapshot() as snap:
+            return reads.federated_handle(snap, task_id.root_job)
+
     @property
     def endpoint_service(self) -> EndpointServiceImpl:
         """The leased endpoint registry these RPCs delegate to (shared with the dashboard)."""
@@ -2339,6 +2358,18 @@ class ControllerServiceImpl:
         task = _read_task_with_attempts(self._db, target.task_id)
         if not task:
             raise ConnectError(Code.NOT_FOUND, f"Task {request.target} not found")
+
+        # A federated task's subtree runs on a peer — it has no local worker or
+        # attempt rows. Proxy the profile through the peer controller (which does
+        # its own task->worker resolution) before the local resolution below, so
+        # it is never dispatched to _backend_for_id's local fallback.
+        handle = self._federated_handle_for_task(target.task_id)
+        if handle is not None:
+            return self._controller.federation.proxy_profile(
+                peer_id=handle.peer_id,
+                remote_job_id=handle.remote_job_id,
+                request=request,
+            )
 
         attempt_id = target.attempt_id if target.attempt_id is not None else task.current_attempt_id
         task_worker_id = _task_worker_id(task)
@@ -2673,6 +2704,18 @@ class ControllerServiceImpl:
         task = _read_task_with_attempts(self._db, task_id)
         if not task:
             raise ConnectError(Code.NOT_FOUND, f"Task {request.task_id} not found")
+
+        # A federated task's subtree runs on a peer — it has no local worker or
+        # attempt rows. Proxy the exec through the peer controller (which does its
+        # own task->worker resolution) before the local resolution below, so it is
+        # never dispatched to _backend_for_id's local fallback.
+        handle = self._federated_handle_for_task(task_id)
+        if handle is not None:
+            return self._controller.federation.proxy_exec(
+                peer_id=handle.peer_id,
+                remote_job_id=handle.remote_job_id,
+                request=request,
+            )
 
         worker_request = worker_pb2.Worker.ExecInContainerRequest(
             task_id=request.task_id,
