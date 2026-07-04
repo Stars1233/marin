@@ -19,7 +19,7 @@ Areas covered:
 """
 
 import secrets
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 
 from rigging.timing import Timestamp
@@ -48,8 +48,9 @@ from iris.cluster.controller.schema import (
 )
 from iris.cluster.controller.worker_health import WorkerHealthTracker
 from iris.cluster.federation.store import FederationDirection
-from iris.cluster.types import AttemptUid, JobName, WorkerId
+from iris.cluster.types import LOCAL_CLUSTER, AttemptUid, JobName, WorkerId
 from iris.rpc import job_pb2
+from iris.time_proto import timestamp_from_proto
 
 REGISTERED_WRITE_FUNCTIONS: list[Callable] = []
 
@@ -185,13 +186,13 @@ def insert_job(
     exit_code: int | None,
     num_tasks: int,
     name: str,
-    child_cluster: str = "",
+    cluster: str = LOCAL_CLUSTER,
 ) -> None:
     """Insert one row into ``jobs``.
 
     TypeDecorators handle JobName → wire string and bool → 0/1 automatically.
-    A non-empty ``child_cluster`` marks the row as a federated handle handed off
-    to that peer (``backend_id`` stays "").
+    ``cluster`` defaults to ``'local'`` (owned here); a peer id marks the row as a
+    federated handle handed off to that peer (``backend_id`` stays "").
     """
     tx.execute(
         insert(jobs_table).values(
@@ -210,7 +211,7 @@ def insert_job(
             exit_code=exit_code,
             num_tasks=num_tasks,
             name=name,
-            child_cluster=child_cluster,
+            cluster=cluster,
         )
     )
 
@@ -351,7 +352,6 @@ def insert_received_handle(
     job_id: JobName,
     requester_id: str,
     owner_principal: str,
-    now_ms: int,
 ) -> None:
     """Record that ``job_id`` was handed to this peer by ``requester_id`` as a
     RECEIVED ``federated_jobs`` row (``peer_id`` is the requester; the SENT-only
@@ -368,7 +368,6 @@ def insert_received_handle(
             direction=int(FederationDirection.RECEIVED),
             peer_id=requester_id,
             owner_principal=owner_principal,
-            last_sync_ms=now_ms,
         )
         .on_conflict_do_update(
             index_elements=["job_id"],
@@ -773,10 +772,8 @@ def insert_federated_handle(
     *,
     job_id: JobName,
     peer_id: str,
-    remote_job_id: str,
     owner_principal: str,
     handoff_state: int,
-    now_ms: int,
 ) -> None:
     """Insert the SENT ``federated_jobs`` handle for a job handed off to ``peer_id``."""
     tx.execute(
@@ -784,22 +781,18 @@ def insert_federated_handle(
             job_id=job_id,
             direction=int(FederationDirection.SENT),
             peer_id=peer_id,
-            remote_job_id=remote_job_id,
             owner_principal=owner_principal,
             handoff_state=handoff_state,
             cancel_intent_version=0,
-            last_sync_ms=now_ms,
         )
     )
 
 
 @writes_to(federated_jobs_table)
-def set_handoff_state(tx: Tx, job_id: JobName, handoff_state: int, *, now_ms: int) -> None:
-    """Flip a handle's ``handoff_state`` and stamp ``last_sync_ms``."""
+def set_handoff_state(tx: Tx, job_id: JobName, handoff_state: int) -> None:
+    """Flip a handle's ``handoff_state``."""
     tx.execute(
-        update(federated_jobs_table)
-        .where(federated_jobs_table.c.job_id == job_id)
-        .values(handoff_state=handoff_state, last_sync_ms=now_ms)
+        update(federated_jobs_table).where(federated_jobs_table.c.job_id == job_id).values(handoff_state=handoff_state)
     )
 
 
@@ -842,8 +835,8 @@ def mirror_federated_job(
 ) -> None:
     """Mirror a peer's job state onto the local federated ``jobs`` row.
 
-    Never touches ``child_cluster``/``backend_id`` (the discriminator stays), only
-    the state/timing/counts the local reads render.
+    Never touches ``cluster``/``backend_id`` (the coordinate stays), only the
+    state/timing/counts the local reads render.
     """
     tx.execute(
         update(jobs_table)
@@ -877,7 +870,7 @@ def mirror_federated_task(
     worker_address: str,
     peer_worker_label: str,
 ) -> None:
-    """Upsert a mirrored federated task row (``child_cluster`` set, no worker FK).
+    """Upsert a mirrored federated task row (``cluster`` set to a peer, no worker FK).
 
     Priority/retry columns are placeholders — a federated task is fold-excluded
     and never scheduled locally — so only the display fields the task views read
@@ -903,7 +896,7 @@ def mirror_federated_task(
             current_worker_id=None,
             current_worker_address=worker_address,
             backend_id="",
-            child_cluster=peer_id,
+            cluster=peer_id,
             priority_neg_depth=0,
             priority_root_submitted_ms=0,
             priority_insertion=0,
@@ -919,7 +912,7 @@ def mirror_federated_task(
                 "failure_count": failure_count,
                 "current_attempt_id": current_attempt_id,
                 "current_worker_address": worker_address,
-                "child_cluster": peer_id,
+                "cluster": peer_id,
             },
         )
     )
@@ -930,11 +923,58 @@ def mirror_federated_task(
     )
 
 
+@writes_to(task_attempts_table)
+def mirror_federated_attempts(
+    tx: Tx,
+    *,
+    task_id: JobName,
+    attempts: Sequence[job_pb2.TaskAttempt],
+) -> None:
+    """Upsert a federated task's attempt rows from a sync delta.
+
+    A federated task has no local ``workers`` row, so ``worker_id`` is NULL.
+    Upserts on the ``(task_id, attempt_id)`` PK so a re-sent delta is idempotent.
+    The peer's raw ``attempt_uid`` is already unique in the global index (job ids
+    are cluster-unique and the parent never runs a handed-off job locally), so it
+    is written verbatim.
+    """
+    for attempt in attempts:
+        started = timestamp_from_proto(attempt.started_at).epoch_ms() if attempt.HasField("started_at") else None
+        finished = timestamp_from_proto(attempt.finished_at).epoch_ms() if attempt.HasField("finished_at") else None
+        attempt_uid = attempt.attempt_uid or f"{task_id.to_wire()}:{attempt.attempt_id}"
+        tx.execute(
+            sqlite_insert(task_attempts_table)
+            .values(
+                task_id=task_id,
+                attempt_id=attempt.attempt_id,
+                worker_id=None,
+                state=attempt.state,
+                created_at_ms=started or 0,
+                started_at_ms=started,
+                finished_at_ms=finished,
+                exit_code=attempt.exit_code or None,
+                error=attempt.error or None,
+                attempt_uid=attempt_uid,
+                backend_id="",
+            )
+            .on_conflict_do_update(
+                index_elements=["task_id", "attempt_id"],
+                set_={
+                    "state": attempt.state,
+                    "started_at_ms": started,
+                    "finished_at_ms": finished,
+                    "exit_code": attempt.exit_code or None,
+                    "error": attempt.error or None,
+                },
+            )
+        )
+
+
 @writes_to(federation_sync_state_table)
-def upsert_sync_cursor(tx: Tx, peer_id: str, cursor: str, *, now_ms: int) -> None:
+def upsert_sync_cursor(tx: Tx, peer_id: str, cursor: str) -> None:
     """Persist the delta-sync cursor for ``peer_id``."""
     tx.execute(
         sqlite_insert(federation_sync_state_table)
-        .values(peer_id=peer_id, cursor=cursor, last_full_resync_ms=now_ms)
+        .values(peer_id=peer_id, cursor=cursor)
         .on_conflict_do_update(index_elements=["peer_id"], set_={"cursor": cursor})
     )

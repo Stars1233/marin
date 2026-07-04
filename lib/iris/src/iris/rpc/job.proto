@@ -273,9 +273,12 @@ message TaskStatus {
   // unrouted. Never an overloaded sentinel; the UI hides the column via multiBackend.
   string backend_id = 24;
 
-  // Federation discriminator, orthogonal to backend_id: "" == owned by this
-  // cluster, "<peer>" == handed off to that peer cluster (backend_id then "").
-  string child_cluster = 25;
+  // Owning cluster, always set and orthogonal to backend_id: "local" == owned
+  // and run by this controller (backend_id then set), "<peer>" == handed off to
+  // that peer cluster (backend_id then "").
+  string cluster = 25;
+
+  reserved 26;  // retired federated remote-id field (job ids are cluster-invariant; no rebasing)
 }
 
 // Record of a single task execution attempt
@@ -381,8 +384,10 @@ message JobStatus {
   // Literal owning backend id. See TaskStatus.backend_id.
   string backend_id = 34;
 
-  // Federation discriminator. See TaskStatus.child_cluster.
-  string child_cluster = 35;
+  // Owning cluster, always set. See TaskStatus.cluster.
+  string cluster = 35;
+
+  reserved 36;  // retired federated remote-id field (job ids are cluster-invariant; no rebasing)
 }
 
 // ============================================================================
