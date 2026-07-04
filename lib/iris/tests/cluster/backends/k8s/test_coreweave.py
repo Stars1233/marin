@@ -36,7 +36,10 @@ from iris.cluster.platforms.k8s.controller import (
     K8sControllerProvider,
 )
 from iris.cluster.platforms.k8s.fake import InMemoryK8sService
-from iris.cluster.platforms.k8s.types import K8sResource
+from iris.cluster.platforms.k8s.types import (
+    K8sResource,
+    iris_priority_class_manifest,
+)
 from iris.cluster.platforms.types import (
     InfraError,
     Labels,
@@ -180,6 +183,11 @@ def test_start_controller_creates_all_resources():
     deploy_spec = dep["spec"]
     node_selector = deploy_spec["template"]["spec"]["nodeSelector"]
     assert node_selector == {iris_labels.iris_scale_group: "cpu-erapids"}
+
+    # Controller is stamped with the control-plane PriorityClass, and that class
+    # is provisioned so the reference resolves at admission.
+    assert deploy_spec["template"]["spec"]["priorityClassName"] == "iris-system"
+    assert k8s.get_json(K8sResource.PRIORITY_CLASSES, "iris-system") is not None
 
     # Controller consumes that env via envFrom (S3 + injected, one flow).
     container = deploy_spec["template"]["spec"]["containers"][0]
@@ -872,6 +880,13 @@ def test_ensure_kueue_queues_noop_without_cluster_queue():
     provider.ensure_kueue_queues(_make_cluster_config())
     assert k8s.get_json(K8sResource.LOCAL_QUEUES, "iris-lq") is None
     provider.shutdown()
+
+
+def test_iris_priority_class_manifest_rejects_unknown_band():
+    """The Kueue installer pins its manager via this helper; an unknown band must
+    raise rather than silently return a wrong-priority (or empty) manifest."""
+    with pytest.raises(ValueError, match="unknown Iris priority class"):
+        iris_priority_class_manifest("iris-nonexistent")
 
 
 # ============================================================================
