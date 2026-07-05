@@ -36,6 +36,7 @@ from iris.cluster.controller.reconcile.snapshot import (
     TaskHistogramRow,
     TaskUpdate,
     TransitionSnapshot,
+    pick_earliest_task_error,
 )
 from iris.cluster.controller.reconcile.task import TerminalDecision, TerminalKind
 from iris.cluster.controller.scheduling.policy import build_scheduling_context, compute_demand_entries
@@ -4527,3 +4528,26 @@ def test_recompute_keeps_job_running_within_budget(task_states, failure_counts, 
     new_state = recompute_state(ws, jid)
 
     assert new_state == job_pb2.JOB_STATE_RUNNING
+
+
+def test_pick_earliest_task_error_reports_first_failed_task():
+    """job.error names the sibling that crashed first, skipping followers that
+    only timed out later, tasks still retrying, and tasks that later succeeded.
+    """
+    root_cause = "CUDA error: an illegal memory access was encountered"
+    follower = "Barrier result: DEADLINE_EXCEEDED; timed out waiting for task 1"
+    candidates = [
+        (0, job_pb2.TASK_STATE_FAILED, Timestamp.from_ms(2000), follower),
+        (1, job_pb2.TASK_STATE_FAILED, Timestamp.from_ms(500), root_cause),
+        (2, job_pb2.TASK_STATE_PENDING, None, "requeued after preemption"),
+        (3, job_pb2.TASK_STATE_SUCCEEDED, Timestamp.from_ms(100), "earlier flake, since retried"),
+    ]
+    assert pick_earliest_task_error(candidates) == root_cause
+
+
+def test_pick_earliest_task_error_none_without_a_failed_task():
+    candidates = [
+        (0, job_pb2.TASK_STATE_SUCCEEDED, Timestamp.from_ms(100), "stale error"),
+        (1, job_pb2.TASK_STATE_PENDING, None, "requeued"),
+    ]
+    assert pick_earliest_task_error(candidates) is None
