@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 import click
 
 from finelog.deploy.bootstrap import render_template
-from finelog.deploy.config import FinelogConfig, assert_inlineable_auth, auth_policy_json
+from finelog.deploy.config import FinelogConfig, auth_policy_json
 from finelog.deploy.image import resolve_image_digest
 
 _TEMPLATE_VAR_RE = re.compile(r"\{\{ (\w+) \}\}")
@@ -44,13 +44,12 @@ _MANIFESTS = ("01-pvc.yaml.tmpl", "02-deployment.yaml.tmpl", "03-service.yaml.tm
 def _auth_env_block(cfg: FinelogConfig) -> str:
     """Render the `FINELOG_AUTH_POLICY` container-env entry, or "" for no policy.
 
-    A cidr-only policy carries no secrets and is injected inline. A policy with a
-    jwt layer carries key material, so it is rejected here — it must be supplied
-    through the `{name}-env` Secret rather than baked into a plaintext manifest.
+    Every layer kind is inline-safe: a cidr layer carries no secrets and a jwt layer
+    carries only Ed25519 public keys, so the policy inlines directly into the plaintext
+    manifest.
     """
     if not cfg.auth:
         return ""
-    assert_inlineable_auth(cfg)
     policy = auth_policy_json(cfg.auth)
     if "'" in policy:
         raise ValueError("auth policy must not contain a single quote")

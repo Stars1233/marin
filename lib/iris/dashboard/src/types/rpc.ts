@@ -495,6 +495,8 @@ export interface UserSummary {
   user: string
   taskStateCounts?: Record<string, number>
   jobStateCounts?: Record<string, number>
+  // Config-derived role from the controller's in-memory RolePolicy.
+  role?: string
 }
 
 export interface ListUsersResponse {
@@ -550,23 +552,6 @@ export interface GetCurrentUserResponse {
   userId: string
   role: string
   displayName?: string
-}
-
-// -- API Keys --
-
-export interface ApiKeyInfo {
-  keyId: string
-  keyPrefix: string
-  userId: string
-  name: string
-  createdAtMs: string
-  lastUsedAtMs: string
-  expiresAtMs: string
-  revoked: boolean
-}
-
-export interface ListApiKeysResponse {
-  keys: ApiKeyInfo[]
 }
 
 // -- Scheduler State --

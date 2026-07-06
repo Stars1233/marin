@@ -9,7 +9,7 @@ objects (or ``Sequence[Row]`` / dicts of them), others return typed dataclasses
 plain sets/dicts of ids.
 
 Areas covered:
-  budgets         — user budgets and roles
+  budgets         — user budgets
   dashboard       — job listing, task summaries, parent-child helpers
   jobs            — job/job_config lookups and CTEs
   scheduling      — pending tasks, running tasks, per-user spend
@@ -40,7 +40,6 @@ from iris.cluster.controller.db import Tx
 from iris.cluster.controller.reconcile.policy import NON_TERMINAL_TASK_STATES
 from iris.cluster.controller.reconcile.worker import ReconcileRow
 from iris.cluster.controller.schema import (
-    USER_ROLE_DEFAULT,
     federated_jobs_table,
     federated_tasks_table,
     federation_changelog_table,
@@ -54,7 +53,6 @@ from iris.cluster.controller.schema import (
     task_attempts_table,
     tasks_table,
     user_budgets_table,
-    users_table,
     workers_table,
 )
 from iris.cluster.controller.task_state import (
@@ -208,21 +206,6 @@ def get_all_user_budget_limits(tx: Tx) -> dict[str, int]:
         )
     ).all()
     return {str(row.user_id): int(row.budget_limit) for row in rows}
-
-
-def get_user_role_or_none(tx: Tx, user_id: str) -> str | None:
-    """Return the user's stored role, or None if the user is not provisioned."""
-    row = tx.execute(
-        select(users_table.c.role).where(users_table.c.user_id == bindparam("user_id")),
-        {"user_id": user_id},
-    ).first()
-    return str(row.role) if row is not None else None
-
-
-def get_user_role(tx: Tx, user_id: str) -> str:
-    """Return the user's role, or ``USER_ROLE_DEFAULT`` if not found."""
-    role = get_user_role_or_none(tx, user_id)
-    return role if role is not None else USER_ROLE_DEFAULT
 
 
 # ---------------------------------------------------------------------------

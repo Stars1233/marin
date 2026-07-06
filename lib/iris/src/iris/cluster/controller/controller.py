@@ -423,6 +423,7 @@ class Controller:
                 cluster_id=config.cluster_id,
                 source_client=self._log_client,
                 state_dir=self._db.db_dir,
+                jwt_manager=config.auth.jwt_manager if config.auth else None,
             )
             if config.finelog.relay_address
             else None
@@ -467,6 +468,7 @@ class Controller:
             port=config.port,
             auth_provider=config.auth_provider,
             auth_policy=request_auth_policy(config.auth),
+            jwt_manager=config.auth.jwt_manager if config.auth else None,
         )
 
         # Wakes the control-tick driver. A submit triggers a schedule-only

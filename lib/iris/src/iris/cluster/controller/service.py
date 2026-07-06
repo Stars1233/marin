@@ -37,14 +37,8 @@ from iris.cluster.constraints import (
 from iris.cluster.controller import ops, reads, writes
 from iris.cluster.controller.auth import (
     DEFAULT_ENDPOINT_TOKEN_TTL_SECONDS,
-    DEFAULT_JWT_TTL_SECONDS,
     MAX_ENDPOINT_TOKEN_TTL_SECONDS,
     ControllerAuth,
-    create_api_key,
-    list_api_keys,
-    lookup_api_key_by_id,
-    revoke_api_key,
-    revoke_login_keys_for_user,
 )
 from iris.cluster.controller.autoscaler.status import PendingHint
 from iris.cluster.controller.backend import BackendCapability, ProviderError, TaskBackend, TaskTarget
@@ -72,6 +66,7 @@ from iris.cluster.controller.schema import (
     local_tasks,
     task_attempts_table,
     tasks_table,
+    user_budgets_table,
     worker_attributes_table,
     workers_table,
 )
@@ -840,15 +835,17 @@ _ACTIVE_JOB_STATES = (
 def _live_user_stats(db: ControllerDB) -> list[UserStats]:
     """Aggregate job/task counts per user.
 
-    The user set is every owner who has ever submitted a job (any state), so the
-    landing page lists people even when none of their jobs are currently active.
-    The per-state counts only cover active (non-terminal) jobs/tasks, so the
-    Running/Pending/Active columns reflect current load and an idle user shows
-    all zeros rather than disappearing.
+    The user set is every observed owner — everyone who has ever submitted a job
+    (any state) plus anyone with a budget row — derived directly from those tables,
+    never a ``users`` table (there is none). So the landing page lists people even
+    when none of their jobs are currently active. The per-state counts only cover
+    active (non-terminal) jobs/tasks, so the Running/Pending/Active columns reflect
+    current load and an idle user shows all zeros rather than disappearing.
     """
     active_states = list(_ACTIVE_JOB_STATES)
     with db.read_snapshot() as tx:
         user_rows = tx.execute(select(jobs_table.c.user_id).distinct()).all()
+        budget_rows = tx.execute(select(user_budgets_table.c.user_id)).all()
         job_rows = tx.execute(
             select(
                 jobs_table.c.user_id,
@@ -871,6 +868,8 @@ def _live_user_stats(db: ControllerDB) -> list[UserStats]:
             {"active_states": active_states},
         ).all()
     by_user: dict[str, UserStats] = {str(row.user_id): UserStats(user=str(row.user_id)) for row in user_rows}
+    for row in budget_rows:
+        by_user.setdefault(str(row.user_id), UserStats(user=str(row.user_id)))
     for row in job_rows:
         stats = by_user.setdefault(str(row.user_id), UserStats(user=str(row.user_id)))
         stats.job_state_counts[int(row.state)] = int(row.cnt)
@@ -2472,8 +2471,14 @@ class ControllerServiceImpl:
         request: controller_pb2.Controller.ListUsersRequest,
         ctx: Any,
     ) -> controller_pb2.Controller.ListUsersResponse:
-        """Return live per-user aggregate counts for the dashboard."""
+        """Return live per-user aggregate counts for the dashboard.
+
+        The user set is derived from observed owners (jobs + budgets), never a
+        ``users`` table; each user's role is resolved from the in-memory,
+        config-derived :class:`RolePolicy` (no DB projection).
+        """
         del request, ctx
+        role_policy = self._auth.role_policy
         users = sorted(
             _live_user_stats(self._db),
             key=lambda entry: (
@@ -2488,6 +2493,7 @@ class ControllerServiceImpl:
                     user=entry.user,
                     task_state_counts=_task_state_counts_for_summary(entry.task_state_counts),
                     job_state_counts=_job_state_counts_for_summary(entry.job_state_counts),
+                    role=role_policy.role_for(entry.user) if role_policy else "",
                 )
                 for entry in users
             ]
@@ -2601,64 +2607,6 @@ class ControllerServiceImpl:
 
     # ── Auth RPCs ────────────────────────────────────────────────────────
 
-    def get_auth_info(
-        self,
-        request: job_pb2.GetAuthInfoRequest,
-        ctx: Any,
-    ) -> job_pb2.GetAuthInfoResponse:
-        return job_pb2.GetAuthInfoResponse(
-            provider=self._auth.provider or "",
-            gcp_project_id=self._auth.gcp_project_id or "",
-        )
-
-    def login(
-        self,
-        request: job_pb2.LoginRequest,
-        ctx: Any,
-    ) -> job_pb2.LoginResponse:
-        if not self._auth.login_verifier:
-            raise ConnectError(Code.UNIMPLEMENTED, "Login not available (no identity provider configured)")
-        if not self._auth.jwt_manager:
-            raise ConnectError(Code.INTERNAL, "JWT manager not configured")
-
-        try:
-            login_identity = self._auth.login_verifier.verify(request.identity_token)
-        except ValueError as exc:
-            logger.info("Login verification failed: %s", exc)
-            raise ConnectError(Code.UNAUTHENTICATED, "Identity verification failed") from exc
-
-        username = login_identity.user_id
-        if username.startswith("system:"):
-            raise ConnectError(Code.PERMISSION_DENIED, "Reserved username prefix")
-
-        now = Timestamp.now()
-        with self._db.transaction() as _tx:
-            writes.ensure_user(_tx, username, now)
-            role = reads.get_user_role(_tx, username)
-
-        # Revoke old login keys and propagate to in-memory revocation set
-        revoked_ids = revoke_login_keys_for_user(self._db, username, now)
-        for jti in revoked_ids:
-            self._auth.jwt_manager.revoke(jti)
-
-        key_id = f"iris_k_{secrets.token_urlsafe(8)}"
-        expires_at = Timestamp.from_ms(now.epoch_ms() + DEFAULT_JWT_TTL_SECONDS * 1000)
-        create_api_key(
-            self._db,
-            key_id=key_id,
-            key_prefix="jwt",
-            user_id=username,
-            name=f"login-{now.epoch_ms()}",
-            now=now,
-            expires_at=expires_at,
-        )
-
-        jwt_token = self._auth.jwt_manager.create_token(username, role, key_id)
-        logger.info(
-            "Login: user=%s, role=%s, new_key=%s, revoked=%d old login keys", username, role, key_id, len(revoked_ids)
-        )
-        return job_pb2.LoginResponse(token=jwt_token, key_id=key_id, user_id=username)
-
     def mint_endpoint_token(
         self,
         request: controller_pb2.Controller.MintEndpointTokenRequest,
@@ -2667,9 +2615,10 @@ class ControllerServiceImpl:
         """Mint a scoped bearer token for one endpoint's /proxy path.
 
         Authorized to the endpoint's owning user (the registering task's owner)
-        or an admin. The token carries no RPC authority (see
-        ``authorize_method``); it is bound to the endpoint's canonical wire name
-        with an ``exp`` deadline, and is revocable via its ``jti`` like any key.
+        or an admin. The token carries no RPC authority (see ``authorize_method``);
+        it is bound to the endpoint's canonical wire name with an ``exp`` deadline.
+        Like every iris token it is stateless — nothing is persisted and it cannot
+        be revoked; it simply ages out at its TTL.
         """
         if not self._auth.jwt_manager:
             raise ConnectError(Code.INTERNAL, "JWT manager not configured")
@@ -2689,103 +2638,13 @@ class ControllerServiceImpl:
 
         now = Timestamp.now()
         expires_at = Timestamp.from_ms(now.epoch_ms() + ttl * 1000)
-        key_id = f"iris_ket_{secrets.token_urlsafe(8)}"
-        # Audit row under the owning user so the token surfaces in `iris key list`
-        # and revoking its jti kills it.
-        create_api_key(
-            self._db,
-            key_id=key_id,
-            key_prefix="ep",
-            user_id=row.task_id.user,
-            name=f"endpoint-token-{row.name}",
-            now=now,
-            expires_at=expires_at,
-        )
-        token = self._auth.jwt_manager.create_endpoint_token(row.name, key_id, ttl_seconds=ttl)
+        # jti is for log correlation only — never persisted, never revocable.
+        jti = f"iris_ket_{secrets.token_urlsafe(8)}"
+        token = self._auth.jwt_manager.create_endpoint_token(row.name, jti, ttl_seconds=ttl)
         return controller_pb2.Controller.MintEndpointTokenResponse(
             token=token,
             expires_at=timestamp_to_proto(expires_at),
         )
-
-    def create_api_key(
-        self,
-        request: job_pb2.CreateApiKeyRequest,
-        ctx: Any,
-    ) -> job_pb2.CreateApiKeyResponse:
-        if not self._auth.jwt_manager:
-            raise ConnectError(Code.INTERNAL, "JWT manager not configured")
-
-        identity = require_identity()
-        target_user = request.user_id or identity.user_id
-        if target_user != identity.user_id:
-            authorize(AuthzAction.MANAGE_OTHER_KEYS)
-
-        now = Timestamp.now()
-        with self._db.transaction() as _tx:
-            writes.ensure_user(_tx, target_user, now)
-            role = reads.get_user_role(_tx, target_user)
-
-        key_id = f"iris_k_{secrets.token_urlsafe(8)}"
-        ttl = request.ttl_ms // 1000 if request.ttl_ms > 0 else DEFAULT_JWT_TTL_SECONDS
-        # Always persist the actual JWT expiry so the DB and token agree.
-        expires_at = Timestamp.from_ms(now.epoch_ms() + ttl * 1000)
-
-        create_api_key(
-            self._db,
-            key_id=key_id,
-            key_prefix="jwt",
-            user_id=target_user,
-            name=request.name or f"key-{now.epoch_ms()}",
-            now=now,
-            expires_at=expires_at,
-        )
-
-        jwt_token = self._auth.jwt_manager.create_token(target_user, role, key_id, ttl_seconds=ttl)
-        # Use key_id prefix (not JWT prefix — all HS256 JWTs share the same header)
-        return job_pb2.CreateApiKeyResponse(key_id=key_id, token=jwt_token, key_prefix=key_id[:8])
-
-    def revoke_api_key(
-        self,
-        request: job_pb2.RevokeApiKeyRequest,
-        ctx: Any,
-    ) -> job_pb2.Empty:
-        identity = require_identity()
-        key = lookup_api_key_by_id(self._db, request.key_id)
-        if key is None:
-            raise ConnectError(Code.NOT_FOUND, f"API key not found: {request.key_id}")
-        if key.user_id != identity.user_id:
-            authorize(AuthzAction.MANAGE_OTHER_KEYS)
-        revoke_api_key(self._db, request.key_id, Timestamp.now())
-        if self._auth.jwt_manager:
-            self._auth.jwt_manager.revoke(request.key_id)
-        return job_pb2.Empty()
-
-    def list_api_keys(
-        self,
-        request: job_pb2.ListApiKeysRequest,
-        ctx: Any,
-    ) -> job_pb2.ListApiKeysResponse:
-        identity = require_identity()
-        target_user = request.user_id or identity.user_id
-        if target_user != identity.user_id:
-            authorize(AuthzAction.MANAGE_OTHER_KEYS)
-
-        keys = list_api_keys(self._db, user_id=target_user if target_user else None)
-        key_infos = []
-        for k in keys:
-            key_infos.append(
-                job_pb2.ApiKeyInfo(
-                    key_id=k.key_id,
-                    key_prefix=k.key_prefix,
-                    user_id=k.user_id,
-                    name=k.name,
-                    created_at_ms=k.created_at_ms.epoch_ms(),
-                    last_used_at_ms=k.last_used_at_ms.epoch_ms() if k.last_used_at_ms else 0,
-                    expires_at_ms=k.expires_at_ms.epoch_ms() if k.expires_at_ms else 0,
-                    revoked=k.revoked_at_ms is not None,
-                )
-            )
-        return job_pb2.ListApiKeysResponse(keys=key_infos)
 
     def get_current_user(
         self,
@@ -2912,7 +2771,6 @@ class ControllerServiceImpl:
             raise ConnectError(Code.INVALID_ARGUMENT, f"Invalid max_band: {request.max_band}")
         now = Timestamp.now()
         with self._db.transaction() as _tx:
-            writes.ensure_user(_tx, request.user_id, now)
             writes.set_user_budget(_tx, request.user_id, request.budget_limit, max_band, now)
         return controller_pb2.Controller.SetUserBudgetResponse()
 
