@@ -38,7 +38,6 @@ import functools
 import logging
 import os
 import pathlib
-import re
 import threading
 import time
 import urllib.error
@@ -155,7 +154,7 @@ class DataConfig:
 
         The env/explicit value is canonicalized through :class:`StoragePath` (trailing
         ``/`` stripped, interior ``//`` collapsed) so downstream joins never double the
-        separator (#6904).
+        separator.
         """
         env_prefix = os.environ.get(_MARIN_PREFIX_ENV)
         if env_prefix:
@@ -312,10 +311,10 @@ def region_from_prefix(prefix: str) -> str | None:
     (e.g. ``gs://marin-eu-west4`` -> ``europe-west4``); unknown ``marin-``
     buckets fall back to stripping the ``marin-`` prefix.
     """
-    m = re.match(r"gs://([^/]+)", prefix)
-    if not m:
+    parsed = StoragePath.parse(prefix)
+    if parsed.scheme != "gs" or not parsed.bucket:
         return None
-    bucket = m.group(1)
+    bucket = parsed.bucket
     for region, spec in data_config().region_buckets.items():
         if spec.name == bucket:
             return region
@@ -344,7 +343,7 @@ class StoragePath:
 
     Object-store keys are not normalized — a doubled ``/`` addresses a *different* key —
     so joins here are structural: a segment never contains a separator, which makes a
-    doubled or trailing separator unrepresentable (#6904). ``parse`` -> ``str`` is
+    doubled or trailing separator unrepresentable. ``parse`` -> ``str`` is
     therefore canonicalizing (interior ``//`` collapsed, trailing ``/`` stripped), not
     byte-preserving.
 
@@ -390,12 +389,34 @@ class StoragePath:
         """The ``/``-joined segments of this path under ``base``.
 
         Structural containment — compares parsed segments, not string prefixes, so a
-        doubled separator on either side cannot fork the answer (#6838).
+        doubled separator on either side cannot fork the answer.
         """
         same_root = (self.scheme, self.netloc, self.rooted) == (base.scheme, base.netloc, base.rooted)
         if not same_root or self.segments[: len(base.segments)] != base.segments:
             raise ValueError(f"{self} is not under {base}")
         return "/".join(self.segments[len(base.segments) :])
+
+    @property
+    def bucket(self) -> str:
+        """The object-store bucket (the authority); empty for a local or empty-authority path."""
+        return self.netloc
+
+    @property
+    def key(self) -> str:
+        """The ``/``-joined key segments beneath the authority (no leading or trailing ``/``)."""
+        return "/".join(self.segments)
+
+    @property
+    def name(self) -> str:
+        """The last key segment (basename), or ``""`` at the authority/filesystem root."""
+        return self.segments[-1] if self.segments else ""
+
+    @property
+    def parent(self) -> "StoragePath":
+        """This path with its last key segment removed; unchanged once at the root."""
+        if not self.segments:
+            return self
+        return dataclasses.replace(self, segments=self.segments[:-1])
 
     def __str__(self) -> str:
         key = "/".join(self.segments)
@@ -414,7 +435,7 @@ def prefix_join(prefix: str, relative: str) -> str:
 
     Object-store keys are not normalized: a naive ``f"{prefix}/{relative}"`` join of a
     trailing-slash prefix produces a doubled separator — a *different* key — silently
-    splitting writers from slash-collapsing readers (#6904). ``str``-in/``str``-out
+    splitting writers from slash-collapsing readers. ``str``-in/``str``-out
     convenience over :class:`StoragePath` for a single join; parse once and use ``/``
     for repeated manipulation.
     """
@@ -467,10 +488,12 @@ def _s3_bucket_from_prefix(prefix: str | None) -> str | None:
     S3 buckets fall through to the flat non-TTL fallback instead of getting a
     ``tmp/ttl=Nd/`` path that would never be cleaned up.
     """
-    if not prefix or not prefix.startswith("s3://"):
+    if not prefix:
         return None
-    bucket = prefix[len("s3://") :].split("/", 1)[0]
-    return bucket if bucket in s3_data_buckets() else None
+    parsed = StoragePath.parse(prefix)
+    if parsed.scheme != "s3":
+        return None
+    return parsed.bucket if parsed.bucket in s3_data_buckets() else None
 
 
 # ---------------------------------------------------------------------------
@@ -586,13 +609,58 @@ def split_gcs_path(gs_uri: str) -> tuple[str, pathlib.Path]:
 
     Returns ``(bucket, Path("."))`` when the URI has no object path component.
     """
-    if not gs_uri.startswith("gs://"):
+    parsed = StoragePath.parse(gs_uri)
+    if parsed.scheme != "gs":
         raise ValueError(f"Invalid GCS URI `{gs_uri}`; expected URI of form `gs://BUCKET/path/to/resource`")
 
-    parts = gs_uri[len("gs://") :].split("/", 1)
-    if len(parts) == 1:
-        return parts[0], pathlib.Path(".")
-    return parts[0], pathlib.Path(parts[1])
+    key = parsed.key
+    return parsed.bucket, pathlib.Path(key) if key else pathlib.Path(".")
+
+
+def rebase_file_path(
+    base_in_path: str,
+    file_path: str,
+    base_out_path: str,
+    new_extension: str | None = None,
+    old_extension: str | None = None,
+) -> str:
+    """Rebase ``file_path`` from under ``base_in_path`` to under ``base_out_path``.
+
+    The path below ``base_in_path`` is preserved beneath ``base_out_path``, optionally
+    swapping the file extension. Containment and joins are structural (via
+    :class:`StoragePath`), so a trailing or doubled separator on any argument cannot
+    double the output separator. ``file_path`` must lie under ``base_in_path``;
+    otherwise a ``ValueError`` is raised.
+
+    Args:
+        base_in_path: The base directory of the input file.
+        file_path: The path of the input file, under ``base_in_path``.
+        base_out_path: The base directory of the output file.
+        new_extension: New file extension including the dot (e.g. ``".parquet"``).
+        old_extension: When given with ``new_extension``, the suffix of ``file_path`` to
+            replace; a ``ValueError`` is raised if ``file_path`` does not end with it.
+            When omitted (but ``new_extension`` is set), everything after the last dot is
+            replaced; with no dot, ``new_extension`` is appended.
+    """
+    rel_path = StoragePath.parse(file_path).relative_to(StoragePath.parse(base_in_path))
+
+    if old_extension and not new_extension:
+        raise ValueError("old_extension requires new_extension to be set")
+
+    if new_extension:
+        if old_extension:
+            # endswith (not rfind) so a mismatch fails loudly instead of silently
+            # truncating: rfind returns -1 and rel_path[:-1] would drop a character.
+            if not rel_path.endswith(old_extension):
+                raise ValueError(
+                    f"Cannot rebase {file_path!r}: relative path {rel_path!r} does not end with "
+                    f"old_extension={old_extension!r}"
+                )
+            rel_path = rel_path[: -len(old_extension)] + new_extension
+        else:
+            dot_idx = rel_path.rfind(".")
+            rel_path = (rel_path[:dot_idx] if dot_idx != -1 else rel_path) + new_extension
+    return prefix_join(base_out_path, rel_path)
 
 
 def get_bucket_location(bucket_name_or_path: str) -> str:
@@ -927,9 +995,9 @@ def _is_gcs_protocol(protocol: str) -> bool:
 
 def _bucket_from_gcs_url(url: str) -> str | None:
     """Return the bucket name from a ``gs://``/``gcs://`` URL, or ``None``."""
-    for scheme in ("gs://", "gcs://"):
-        if url.startswith(scheme):
-            return url[len(scheme) :].split("/", 1)[0]
+    parsed = StoragePath.parse(url)
+    if parsed.scheme in ("gs", "gcs"):
+        return parsed.bucket
     return None
 
 
@@ -1325,14 +1393,18 @@ class MirrorFileSystem(fsspec.AbstractFileSystem):
         """Return (fsspec_fs, path) for a full URL or local path."""
         return fsspec.core.url_to_fs(url)
 
+    @property
+    def _local_root(self) -> StoragePath:
+        return StoragePath.parse(self._local_prefix)
+
     def _local_url(self, path: str) -> str:
-        return f"{self._local_prefix}/{path}"
+        return str(self._local_root / path)
 
     def _remote_url(self, prefix: str, path: str) -> str:
-        return f"{prefix}/{path}"
+        return prefix_join(prefix, path)
 
     def _lock_path_for(self, path: str) -> str:
-        return f"{self._local_prefix}/.mirror_locks/{path}.lock"
+        return str(self._local_root / ".mirror_locks" / f"{path}.lock")
 
     def _fs_exists(self, url: str) -> bool:
         fs, fspath = self._get_fs_and_path(url)
@@ -1433,7 +1505,7 @@ class MirrorFileSystem(fsspec.AbstractFileSystem):
         seen: dict[str, dict[str, Any]] = {}
 
         for prefix in [self._local_prefix, *self._remote_prefixes]:
-            url = f"{prefix}/{path}"
+            url = prefix_join(prefix, path)
             fs, fspath = self._get_fs_and_path(url)
             try:
                 entries = fs.ls(fspath, detail=True, **kwargs)

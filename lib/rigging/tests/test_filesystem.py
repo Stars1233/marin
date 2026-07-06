@@ -6,7 +6,15 @@
 from pathlib import Path
 
 import pytest
-from rigging.filesystem import StoragePath, atomic_rename, prefix_join, unique_temp_path
+from rigging.filesystem import (
+    StoragePath,
+    _bucket_from_gcs_url,
+    atomic_rename,
+    prefix_join,
+    rebase_file_path,
+    split_gcs_path,
+    unique_temp_path,
+)
 
 
 @pytest.mark.parametrize(
@@ -68,6 +76,103 @@ def test_storage_path_relative_to_is_structural():
 
     with pytest.raises(ValueError, match="not under"):
         StoragePath.parse("gs://other/cache/x").relative_to(base)
+
+
+@pytest.mark.parametrize(
+    ("raw", "bucket", "key", "name", "parent"),
+    [
+        ("gs://bucket/a/b/c", "bucket", "a/b/c", "c", "gs://bucket/a/b"),
+        ("gs://bucket/a//b/", "bucket", "a/b", "b", "gs://bucket/a"),
+        ("gs://bucket/only", "bucket", "only", "only", "gs://bucket"),
+        ("gs://bucket", "bucket", "", "", "gs://bucket"),
+        ("/tmp/x/y", "", "tmp/x/y", "y", "/tmp/x"),
+        ("/", "", "", "", "/"),
+        ("rel/path", "", "rel/path", "path", "rel"),
+    ],
+)
+def test_storage_path_accessors(raw, bucket, key, name, parent):
+    sp = StoragePath.parse(raw)
+    assert sp.bucket == bucket
+    assert sp.key == key
+    assert sp.name == name
+    assert str(sp.parent) == parent
+
+
+@pytest.mark.parametrize(
+    ("uri", "bucket", "path"),
+    [
+        ("gs://bucket/path/to/resource", "bucket", "path/to/resource"),
+        ("gs://bucket/a//b/", "bucket", "a/b"),
+        ("gs://bucket", "bucket", "."),
+        ("gs://bucket/", "bucket", "."),
+    ],
+)
+def test_split_gcs_path(uri, bucket, path):
+    got_bucket, got_path = split_gcs_path(uri)
+    assert got_bucket == bucket
+    assert got_path == Path(path)
+
+
+def test_split_gcs_path_rejects_non_gcs():
+    with pytest.raises(ValueError, match="Invalid GCS URI"):
+        split_gcs_path("s3://bucket/x")
+
+
+@pytest.mark.parametrize(
+    ("url", "bucket"),
+    [
+        ("gs://bucket/path", "bucket"),
+        ("gcs://bucket/path", "bucket"),
+        ("gs://bucket", "bucket"),
+        ("s3://bucket/path", None),
+        ("/local/path", None),
+    ],
+)
+def test_bucket_from_gcs_url(url, bucket):
+    assert _bucket_from_gcs_url(url) == bucket
+
+
+@pytest.mark.parametrize(
+    ("base_in", "file_path", "base_out", "new_ext", "old_ext", "expected"),
+    [
+        # Extension swap under a trailing-slash output base (a common caller pattern).
+        (
+            "gs://b/in",
+            "gs://b/in/sub/doc.jsonl.gz",
+            "gs://b/out/data/",
+            ".parquet",
+            ".jsonl.gz",
+            "gs://b/out/data/sub/doc.parquet",
+        ),
+        # Trailing slash on the input base collapses structurally.
+        ("gs://b/in/", "gs://b/in/a/b/doc.json", "gs://b/out", ".parquet", ".json", "gs://b/out/a/b/doc.parquet"),
+        # Without old_extension, everything after the last dot is replaced.
+        ("gs://b/in", "gs://b/in/doc.jsonl.zst", "gs://b/out", ".parquet", None, "gs://b/out/doc.jsonl.parquet"),
+        # Without old_extension and no dot in the name, new_extension is appended.
+        ("gs://b/in", "gs://b/in/noext", "gs://b/out", ".txt", None, "gs://b/out/noext.txt"),
+        # No extension change — pure rebase.
+        ("gs://b/in", "gs://b/in/x/doc", "gs://b/out", None, None, "gs://b/out/x/doc"),
+        # Local paths.
+        ("/tmp/in", "/tmp/in/x/doc.jsonl", "/tmp/out", ".parquet", ".jsonl", "/tmp/out/x/doc.parquet"),
+    ],
+)
+def test_rebase_file_path(base_in, file_path, base_out, new_ext, old_ext, expected):
+    assert rebase_file_path(base_in, file_path, base_out, new_ext, old_ext) == expected
+
+
+def test_rebase_file_path_rejects_file_outside_base():
+    with pytest.raises(ValueError, match="not under"):
+        rebase_file_path("gs://b/in", "gs://b/other/doc.jsonl", "gs://b/out")
+
+
+def test_rebase_file_path_wrong_old_extension():
+    with pytest.raises(ValueError, match="does not end with"):
+        rebase_file_path("gs://b/in", "gs://b/in/doc.jsonl", "gs://b/out", ".parquet", ".csv")
+
+
+def test_rebase_file_path_old_extension_requires_new():
+    with pytest.raises(ValueError, match="requires new_extension"):
+        rebase_file_path("gs://b/in", "gs://b/in/doc.jsonl", "gs://b/out", old_extension=".jsonl")
 
 
 def test_unique_temp_path_produces_distinct_paths():
