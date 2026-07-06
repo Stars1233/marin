@@ -10,7 +10,7 @@ import logging
 import sys
 
 import click
-from rigging.auth import MARIN_DESKTOP_OAUTH_CLIENT, run_iap_desktop_login
+from rigging.auth import MARIN_DESKTOP_OAUTH_CLIENT, IapCredentialsUnavailable, run_iap_desktop_login
 from rigging.config_discovery import resolve_cluster_config
 from rigging.credential_store import CredentialRecord, save_credentials
 from rigging.log_setup import configure_logging
@@ -130,6 +130,14 @@ def login(ctx, headless):
     flow and caches the long-lived IAP edge refresh token, from which each later
     RPC silently re-mints the short-lived edge token IAP requires. Non-IAP
     clusters need no login (in-network / loopback trust admits the caller).
+
+    On a box with no local browser but where you can open a URL elsewhere, pass
+    ``--headless`` (auto-detected when no browser is registered) to authenticate by
+    pasting the returned code. Fully unattended callers (CI / agents, no human at
+    all) skip login entirely and instead give the process service-account
+    credentials on the cluster's IAP allowlist — e.g. ``gcloud auth
+    application-default login --impersonate-service-account=<sa>``; see
+    ``lib/iris/docs/iap-gclb.md``.
     """
     controller_url = require_controller_url(ctx)
     config = ctx.obj.get("config")
@@ -153,7 +161,13 @@ def login(ctx, headless):
     try:
         _id_token, refresh_token = run_iap_desktop_login(client_id, client_secret, headless=headless)
     except Exception as e:
-        raise click.ClickException(f"IAP authentication failed: {e}") from e
+        raise click.ClickException(
+            f"IAP authentication failed: {e}\n"
+            "If you are fully unattended (CI / agent), skip `iris login` and give the "
+            "process service-account credentials on the cluster's IAP allowlist, e.g. "
+            "`gcloud auth application-default login --impersonate-service-account=<sa>`. "
+            "See lib/iris/docs/iap-gclb.md."
+        ) from e
 
     save_credentials(
         CredentialRecord(
@@ -244,6 +258,7 @@ def budget_list(ctx):
 from iris.cli.actor import actor as actor_cmd  # noqa: E402
 from iris.cli.build import build  # noqa: E402
 from iris.cli.cluster import cluster  # noqa: E402
+from iris.cli.endpoints import endpoints  # noqa: E402
 from iris.cli.job import job  # noqa: E402
 from iris.cli.process_status import register_process_status_commands  # noqa: E402
 from iris.cli.query import query_cmd  # noqa: E402
@@ -253,8 +268,29 @@ from iris.cli.task import task  # noqa: E402
 iris.add_command(actor_cmd)
 iris.add_command(cluster)
 iris.add_command(build)
+iris.add_command(endpoints)
 iris.add_command(job)
 iris.add_command(task)
 iris.add_command(query_cmd)
 register_rpc_commands(iris)
 register_process_status_commands(iris)
+
+
+def main() -> None:
+    """Console-script entry point: run the ``iris`` group with clean auth errors.
+
+    IAP credential failures surface lazily from deep in an RPC call as a bare
+    ``IapCredentialsUnavailable``. Catch it here to print an actionable hint
+    instead of a stack trace; every other exception keeps its normal traceback.
+    """
+    try:
+        iris()
+    except IapCredentialsUnavailable as exc:
+        click.secho(f"Error: {exc}", fg="red", err=True)
+        click.echo(
+            "Run `iris login` for the interactive path, or for an unattended caller "
+            "`gcloud auth application-default login --impersonate-service-account=<sa>`. "
+            "See lib/iris/docs/iap-gclb.md.",
+            err=True,
+        )
+        sys.exit(1)

@@ -4,11 +4,45 @@ All subcommands have `--help`. Use it.
 
 Connection selectors:
 
-- `--cluster=NAME` (preferred for known clusters): resolves a named config and auto-tunnels.
-- `--config=PATH`: pins an exact YAML config file and auto-tunnels.
-- `--controller-url=URL`: connects to a manually established tunnel.
+- `--cluster=NAME` (preferred for known clusters): resolves a named config.
+- `--config=PATH`: pins an exact YAML config file.
+- `--controller-url=URL`: connects to an explicit URL.
+
+How the controller is reached depends on the cluster. **IAP-fronted clusters
+(marin, marin-dev) are reached directly over their IAP HTTPS URL — there is no
+SSH tunnel**; `require_controller_url` returns the IAP URL and every request is
+authenticated at the edge (see [Authentication](#authentication-headless--ci) and
+`docs/iap-gclb.md`). Non-IAP clusters open an SSH tunnel to the controller VM
+automatically.
 
 Use `iris cluster list` to see named clusters. Use `--config` when you mean a custom or pinned file path.
+
+## Authentication (headless / CI)
+
+For an IAP-fronted cluster the CLI authenticates every request at the IAP edge;
+the controller mints no token. Two ways to get an edge token:
+
+- **Interactive** — `iris --cluster=NAME login` runs the desktop OAuth browser
+  flow and caches a refresh token. Needs a browser; not usable headless.
+- **Headless / CI / agent** — do **not** run `iris login` (it needs a browser).
+  Instead give the process credentials for an *IAP-allowlisted service account*.
+  The keyless way is to point your ADC at one by impersonation — no browser, no
+  key file; iris reads it through the standard resolver with no flag or env:
+
+  ```bash
+  gcloud auth application-default login \
+    --impersonate-service-account=iris-controller@hai-gcp-models.iam.gserviceaccount.com
+  iris --cluster=marin-dev cluster status
+  ```
+
+  Needs `roles/iam.serviceAccountTokenCreator` on the SA (to impersonate) and
+  `roles/iap.httpsResourceAccessor` on the cluster backend for that SA (the IAP
+  allowlist — the impersonated SA email is the identity IAP authorizes). On a GCE
+  VM whose service account is already allowlisted none of this is needed: ambient
+  metadata credentials are used automatically.
+
+See `docs/iap-gclb.md` ("The three caller paths") for the audience-vs-identity
+model behind this.
 
 ## Cluster Lifecycle
 
@@ -27,7 +61,7 @@ Workflow: dry-run locally (`iris cluster controller serve --dry-run`) -> capture
 
 If checkpoint times out: `iris cluster controller restart --skip-checkpoint` (restores from last periodic checkpoint; some recent state may be lost).
 
-**Shipping a code change ≠ restarting.** marin pins `iris-controller:latest` (`config/marin.yaml:33`), so a restart only re-pulls whatever `:latest` currently is. To deploy a merged controller fix you must first rebuild the image (`gh workflow run "Ops - Docker Images"`, or wait for the Sunday build) and *then* restart — restarting against a stale `:latest` ships nothing. Confirm the controller is running the `:<git-short-hash>` you expect, not just that it came back up. Skipping the rebuild cost ~5 red-canary days (`.agents/ops/2026-06-08-canary-ferry-reservation-taint-timeouts.md`).
+**Restart builds and deploys your local working tree.** `iris cluster controller restart` builds fresh controller/worker/task images from your **current checkout — HEAD plus any staged/unstaged changes** (`get_git_sha()` is a tree-content hash), pushes them (`:<hash>` and `:latest`), pins the deploy to `:<hash>` in memory, and restarts the container in place. So the restart ships whatever code is in your tree; there is no separate image-rebuild step. To deploy a merged controller fix: update your checkout (`git pull`, or check out the fix) **then** restart — restarting from a stale checkout ships that stale code. Always confirm the controller is running the `:<git-short-hash>` you expect (`iris cluster status`), not just that it came back up; a stale-checkout deploy once cost ~5 red-canary days (`.agents/ops/2026-06-08-canary-ferry-reservation-taint-timeouts.md`).
 
 ### Controller Checkpoint Rollback (wedged / OOM recovery)
 

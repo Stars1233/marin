@@ -30,7 +30,7 @@ from iris.client import IrisClient, Job
 from iris.cluster.constraints import region_constraint
 from iris.cluster.tpu_topology import get_tpu_topology
 from iris.cluster.types import EndpointAccess, Entrypoint, EnvironmentSpec, ResourceSpec, is_job_finished, tpu_device
-from rigging.connect import proxy_path
+from rigging.connect import capability_path, proxy_path
 from rigging.timing import Duration
 
 from marin.inference.quick_serve import QuickServeConfig, serve_in_job
@@ -81,29 +81,31 @@ def _wait_for_endpoint(client: IrisClient, job: Job, endpoint_name: str, timeout
     )
 
 
-def _mint_and_print_bearer_access(
+def _mint_and_print_capability_url(
     client: IrisClient, endpoint: str, dashboard_url: str | None, ttl_hours: float
 ) -> None:
-    """Mint a scoped endpoint token and print the off-cluster OpenAI base_url + api_key.
+    """Mint a scoped endpoint token and print the off-cluster capability URL.
 
-    Runs CLI-side under the launching user's identity, so the controller's
-    owner check passes. The token authorizes only this endpoint's ``/proxy``
-    path and expires after ``ttl_hours`` (clamped to the controller's maximum).
+    Runs CLI-side under the launching user's identity, so the controller's owner
+    check passes. The URL embeds the scoped token in its path (gist-style):
+    possession of the URL is the credential, so no auth header is needed. It
+    authorizes only this endpoint and expires after ``ttl_hours`` (clamped to the
+    controller's maximum).
     """
     resp = client._cluster_client.mint_endpoint_token(endpoint, ttl=Duration.from_hours(ttl_hours))
     hours_left = max(0.0, (resp.expires_at.epoch_ms - int(time.time() * 1000)) / 3_600_000)
-    click.echo("  BEARER — off-cluster access (scoped token):")
+    click.echo("  Shared capability URL (token in the path — anyone with the URL can call it):")
     if dashboard_url:
-        base_url = f"{dashboard_url.rstrip('/')}{proxy_path(endpoint)}/v1"
+        base_url = f"{dashboard_url.rstrip('/')}{capability_path(endpoint, resp.token)}/v1"
         click.echo(f"    base_url   {base_url}")
+        click.echo("    api_key    <any non-empty string>   (the URL already carries the credential)")
+        click.echo(f"    expires    in {hours_left:.1f}h")
+        click.echo(f"    example    curl {base_url}/models")
     else:
-        # No public origin known (bare --controller); the operator must front the
-        # controller's /proxy route for this to be reachable off-cluster.
-        click.echo(f"    proxy path {proxy_path(endpoint)}/v1  (front the controller /proxy route to reach it)")
-    click.echo(f"    api_key    {resp.token}")
-    click.echo(f"    expires    in {hours_left:.1f}h")
-    if dashboard_url:
-        click.echo(f'    example    curl {base_url}/models -H "Authorization: Bearer <api_key>"')
+        # No public origin known (bare --controller); front the controller's
+        # /proxy/t route for this to be reachable off-cluster.
+        click.echo(f"    path       {capability_path(endpoint, resp.token)}/v1  (front the controller /proxy/t route)")
+        click.echo(f"    expires    in {hours_left:.1f}h")
     click.echo("")
 
 
@@ -130,10 +132,10 @@ def _mint_and_print_bearer_access(
 @click.option("--timeout-hours", type=float, default=24.0, help="Wall-clock lifetime before the server self-stops.")
 @click.option(
     "--access",
-    type=click.Choice(["private", "public", "bearer"]),
+    type=click.Choice(["private", "link"]),
     default="private",
-    help="Proxy access. private: cluster identity only. public: open. bearer: mints a "
-    "scoped off-cluster token (printed once vLLM is ready).",
+    help="Proxy access. private: cluster identity only. link: mints a scoped capability "
+    "URL anyone with the link can call off-cluster (printed once vLLM is ready).",
 )
 @click.option("--region", default=None, help="Comma-separated region(s) to pin the slice to.")
 @click.option("--cpu", type=float, default=8.0)
@@ -256,8 +258,8 @@ def main(
 
             if not wait:
                 click.echo("Submitted. Open the dashboard from the Iris UI once vLLM has booted.")
-                if endpoint_access == EndpointAccess.ENDPOINT_ACCESS_BEARER:
-                    click.echo("Re-run with --wait once vLLM registers to mint the off-cluster bearer token.")
+                if endpoint_access == EndpointAccess.ENDPOINT_ACCESS_LINK:
+                    click.echo("Re-run with --wait once vLLM registers to mint the off-cluster capability URL.")
                 return
 
             click.echo("Waiting for vLLM to boot and register (Ctrl-C to detach; the job keeps running) …")
@@ -268,10 +270,10 @@ def main(
             if dashboard_url:
                 click.echo(f"        share:     {dashboard_url.rstrip('/')}{proxy_path(endpoint)}/")
             click.echo("")
-            if endpoint_access == EndpointAccess.ENDPOINT_ACCESS_BEARER:
+            if endpoint_access == EndpointAccess.ENDPOINT_ACCESS_LINK:
                 # Mint after the endpoint registers (the controller resolves the row
                 # for owner authz), so the token is bound to a live endpoint.
-                _mint_and_print_bearer_access(client, endpoint, dashboard_url, timeout_hours)
+                _mint_and_print_capability_url(client, endpoint, dashboard_url, timeout_hours)
             click.echo("Tunnel held open; press Ctrl-C to detach (the server stays up on Iris).")
             with contextlib.suppress(KeyboardInterrupt):
                 while True:
