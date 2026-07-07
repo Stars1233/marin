@@ -130,6 +130,68 @@ def _source_docs(source_summary: list[dict] | None) -> dict[str, int]:
     return {r["source"]: r["docs_est"] for r in source_summary or [] if r.get("docs_est")}
 
 
+@dataclasses.dataclass
+class _SourceSummary:
+    """Per-source doc-count summary, filled progressively by a background thread.
+
+    ``docs_est`` is a parquet file-count — a fast, bounded size proxy that drives
+    the store sampler's cheapest-source-first ordering; the leaderboard displays it
+    as it fills in. ``ready`` flips true once every source has been counted.
+    """
+
+    rows: list[dict] = dataclasses.field(default_factory=list)
+    ready: bool = False
+
+
+def _start_source_summary(dv: WebExplorer, lineage: StoreLineage, ducky: DuckyClient, state: _SourceSummary) -> None:
+    """Compute the Sources leaderboard in the background, in two progressive passes.
+
+    Pass 1 counts each source's parquet *files* (a fast, bounded glob listing) and
+    installs them as ``source_docs`` so the store sampler's smallest-source-first
+    ordering is ready within seconds. Pass 2 computes the full per-source stats
+    (exact doc count, quality distribution, contamination, dedup) one source at a
+    time, filling the leaderboard columns live; the exact doc counts replace the
+    file-count proxy in ``source_docs`` only once all are in, to keep the sampler's
+    size ordering on a single consistent scale throughout.
+    """
+
+    def _run() -> None:
+        rows: dict[str, dict] = {}
+        # pass 1: file-count sizes -> sampler ordering (consistent scale, fast)
+        sizes: dict[str, int] = {}
+        for src, base in sorted(lineage.normalize.items()):
+            try:
+                n = ducky.run(f"SELECT count(*) FROM glob('{base}/outputs/main/*.parquet')").scalar()
+            except DuckyError:
+                n = None
+            if n:
+                sizes[src] = n
+            rows[src] = {"source": src, "docs_est": n}
+            dv.source_docs = dict(sizes)  # atomic swap; the sampler reads source_docs.get(...)
+            state.rows = list(rows.values())
+        logger.info("source sizes counted: %d sources", len(rows))
+        # pass 2: full per-source stats -> leaderboard columns, progressive.
+        # Smallest sources first (by the pass-1 sizes) so most columns fill fast,
+        # leaving the few huge sources (slow exact counts) for last.
+        exact: dict[str, int] = {}
+        for src in sorted(lineage.normalize, key=lambda s: sizes.get(s, 1 << 62)):
+            try:
+                stats = dv.source_summary_stats(src)
+            except DuckyError as e:
+                logger.warning("source stats for %s failed: %s", src, e)
+                continue
+            rows[src] = {**rows[src], **stats}
+            if stats.get("docs_est"):
+                exact[src] = stats["docs_est"]
+            state.rows = list(rows.values())
+        if exact:
+            dv.source_docs = exact  # exact counts, one consistent scale for ordering + display
+        state.ready = True
+        logger.info("source summary fully computed: %d sources", len(rows))
+
+    threading.Thread(target=_run, name="source-summary", daemon=True).start()
+
+
 def _dedup_attr_map(ducky: DuckyClient, lineage: StoreLineage) -> dict[str, str]:
     """Map source -> per-source fuzzy-dup attr dir, from the dedup artifact (via ducky).
 
@@ -227,6 +289,11 @@ def build_app(
     dist = _dashboard_dist()
     dv = WebExplorer(lineage, ducky, _source_docs(source_summary), _dedup_attr_map(ducky, lineage))
     manager = QueryManager(_build_views(dv))
+    # A pre-baked WEB_EXPLORER_SOURCE_SUMMARY is used as-is; otherwise the app
+    # computes per-source sizes itself in the background and fills them in live.
+    summary = _SourceSummary(rows=source_summary or [], ready=source_summary is not None)
+    if source_summary is None:
+        _start_source_summary(dv, lineage, ducky, summary)
 
     def overview() -> dict:
         buckets = [
@@ -257,7 +324,9 @@ def build_app(
             "dedup": lineage.dedup,
             "counters": payload.counters,
             "buckets": buckets,
-            "source_summary": source_summary or [],
+            "source_summary": summary.rows,
+            "source_summary_ready": summary.ready,
+            "source_summary_total": len(lineage.normalize),
         }
 
     async def index(request: Request) -> HTMLResponse:
@@ -265,6 +334,10 @@ def build_app(
 
     async def api_overview(_request: Request) -> JSONResponse:
         return JSONResponse(overview())
+
+    async def api_source_summary(_request: Request) -> JSONResponse:
+        # Lightweight endpoint the dashboard polls while the background count fills in.
+        return JSONResponse({"ready": summary.ready, "rows": summary.rows, "total": len(lineage.normalize)})
 
     async def api_query(request: Request) -> JSONResponse:
         body = await request.json()
@@ -297,6 +370,7 @@ def build_app(
         routes=[
             Route("/", index),
             Route("/api/overview", api_overview),
+            Route("/api/source-summary", api_source_summary),
             Route("/api/query", api_query, methods=["POST"]),
             Route("/api/result/{query_id:str}", api_result),
             Route("/api/ducky-status", api_ducky_status),
