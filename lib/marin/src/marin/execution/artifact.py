@@ -23,7 +23,8 @@ their producers (``LevanterCheckpoint`` in ``marin.training.training``, ``Tokeni
 import functools
 import json
 import logging
-from dataclasses import asdict, is_dataclass
+import threading
+from dataclasses import asdict, dataclass, is_dataclass
 from typing import Self, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -157,6 +158,10 @@ class ArtifactRecord(BaseModel):
     output_path: str = ""
     deps: list[str] = Field(default_factory=list)
     """Dependency identities as ``name@version`` strings."""
+    dep_paths: list[str] = Field(default_factory=list)
+    """Resolved output paths of the dependencies, aligned index-wise with ``deps``. ``deps`` is
+    the portable identity; this is where each dep's record actually lives, which differs from a
+    reconstruction off the identity when the dep overrode its output path."""
     config: dict[str, JSONValue] | None = None
     """The materialized config that ran (canonical-encoded), for humans and consumer metadata."""
     source: str | None = None
@@ -290,6 +295,66 @@ def read_artifact(output_path: str, schema: type[M]) -> M:
 def write_artifact(value: object, output_path: str) -> None:
     """Write a minimal record carrying ``value`` as its ``result`` — the manual save API."""
     write_record(ArtifactRecord(output_path=output_path, result=_payload_json(value)))
+
+
+@functools.cache
+def _capture_provenance_once() -> Provenance:
+    return Provenance.capture()
+
+
+_provenance_lock = threading.Lock()
+
+
+def _best_effort_provenance() -> Provenance:
+    """The run's provenance, captured once per process.
+
+    Provenance is constant within a run, so capture it once: the runner writes records from many
+    worker threads, and calling ``capture()`` per step would both repeat the work and race on the
+    repo's ``index.lock`` (``git stash create``) when the driver runs from a real checkout. The
+    lock serializes the first, cache-filling call across those threads. ``capture()`` itself never
+    raises -- git fields degrade to empty outside a checkout or without a ``git`` binary.
+    """
+    with _provenance_lock:
+        return _capture_provenance_once()
+
+
+@dataclass(frozen=True)
+class StepRecordIdentity:
+    """Identity + lineage of a ``StepRunner`` step, as plain data (no callable) so a remote
+    write site can serialize it into a worker closure."""
+
+    name: str
+    deps: list[str]
+    """Dependency identities, each a ``name_with_hash``."""
+    dep_paths: list[str]
+    """Resolved dependency locations, aligned index-wise with ``deps``."""
+    config: dict[str, JSONValue] | None
+    """The step's ``hash_attrs`` -- its materialized identity params."""
+    fingerprint_payload: str | None = None
+
+
+def write_step_record(identity: StepRecordIdentity, *, output_path: str, result: object) -> None:
+    """Persist a ``StepRunner`` step's full record: identity + lineage + payload + provenance.
+
+    Unlike :func:`write_artifact` (which records only ``output_path`` + ``result``), this carries
+    the ``name``, the dependency identities (``deps`` -- each a ``name_with_hash``) alongside their
+    resolved locations (``dep_paths`` -- where each dep's record actually lives, even when the dep
+    overrode its output path), the ``config`` that determined the output, and best-effort
+    provenance -- so a produced directory answers "what made me, from what" on its own, walkable
+    recursively through ``dep_paths``.
+    """
+    write_record(
+        ArtifactRecord(
+            name=identity.name,
+            output_path=output_path,
+            deps=identity.deps,
+            dep_paths=identity.dep_paths,
+            config=identity.config,
+            result=_payload_json(result) if result is not None else None,
+            fingerprint_payload=identity.fingerprint_payload,
+            provenance=_best_effort_provenance(),
+        )
+    )
 
 
 def check_drift(step: StepSpec) -> bool:
