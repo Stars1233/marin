@@ -21,7 +21,7 @@ import copy
 import ipaddress
 import logging
 import os
-from collections.abc import Iterator, Mapping
+from collections.abc import Collection, Iterator, Mapping
 from pathlib import Path
 from typing import Annotated, Any, ClassVar, Literal
 
@@ -552,6 +552,19 @@ class AuthConfig(_OneofConfig):
     # and NOT secret. Served on JWKS alongside the current key during a rotation
     # overlap so verifiers accept tokens minted by the prior key.
     previous_public_keys: tuple[str, ...] = ()
+    # Inbound federation trust — this cluster acting as a peer that receives whole
+    # jobs. Maps a parent cluster id to its published EdDSA public key (a
+    # SubjectPublicKeyInfo PEM, inline, non-secret). The dedicated federation JWT
+    # verifier trusts exactly these issuers under aud="federation", kept off the
+    # control-plane audience set so a federation bearer never becomes a full RPC
+    # identity. Empty leaves inbound federation closed (no token verifies).
+    federation_peers: dict[str, str] = Field(default_factory=dict)
+    # Which submitters this cluster admits via an inbound federation handoff, keyed
+    # on the asserted submitting_user — allow-policy syntax ("*", "*@domain", or an
+    # exact identity). Empty admits none (fail closed); a receiving cluster narrows
+    # it explicitly, e.g. ["*@openathena.ai"]. A local_admin (CIDR/loopback) identity
+    # is never a valid federation submitter regardless of this list.
+    allowed_submitters: list[str] = Field(default_factory=list)
 
     @field_validator("trusted_cidrs")
     @classmethod
@@ -619,10 +632,32 @@ class EndpointSpec(_Config):
 # ---------------------------------------------------------------------------
 
 
+def user_admitted(allowed_users: Collection[str], user: str) -> bool:
+    """Whether an allow policy admits ``user``.
+
+    ``"*"`` admits anyone; ``"*@example.com"`` admits any email in that domain
+    (case-insensitive on the domain part); every other entry is an exact match on
+    the full identity. The one matcher shared by backend routing policy and
+    per-peer federation policy, so both admit users the same way.
+    """
+    if "*" in allowed_users or user in allowed_users:
+        return True
+    if "@" not in user:
+        return False
+    domain = user.rsplit("@", 1)[1].lower()
+    return f"*@{domain}" in {entry.lower() for entry in allowed_users}
+
+
 class AllowPolicy(_Config):
-    """Which users may route tasks to a backend. ``"*"`` matches all users."""
+    """Which users an allow policy admits — to route tasks to a backend, or to
+    federate a job to a peer. ``"*"`` matches all users; ``"*@example.com"`` matches
+    any email in that domain; anything else is an exact identity match."""
 
     users: list[str] = Field(default_factory=lambda: ["*"])
+
+    def admits(self, user: str) -> bool:
+        """Whether this policy admits ``user`` (see :func:`user_admitted`)."""
+        return user_admitted(self.users, user)
 
 
 class BackendConfig(_Config):
@@ -674,6 +709,10 @@ class PeerConfig(_Config):
     controller_address: str  # peer controller RPC address (reachability)
     dashboard_url: str = ""  # peer public dashboard origin, for deep links
     cluster: str = ""  # peer cluster manifest name; resolves the presented credentials
+    # Which submitting_users this cluster may federate to this peer. Gates on the
+    # authenticated principal (never the caller-chosen owner). Defaults to admit-all,
+    # so a peer must be narrowed in config (e.g. ["*@openathena.ai"]) to restrict it.
+    allow_policy: AllowPolicy = Field(default_factory=AllowPolicy)
 
 
 class ClusterFinelogConfig(_Config):
