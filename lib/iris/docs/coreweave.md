@@ -9,10 +9,15 @@ the full operator runbook (RBAC, NodePools, Kueue, troubleshooting).
 
 Active clusters:
 
-| Iris cluster | CW cluster / region | Fleet | Kubeconfig |
-|--------------|---------------------|-------|------------|
-| `cw-us-east-02a` | `marin-gpu`, US-EAST-02A | 32× 8xH100 + 4× CPU Genoa, pinned warm | `~/.kube/coreweave-iris-gpu` |
-| `cw-rno2a` | `marin-rn02a`, RNO2A | 64× 8xH100 + 1× CPU Turin, pinned warm | `~/.kube/coreweave-iris-rno2a` |
+All clusters share one kubeconfig at `~/.kube/coreweave-iris`; each cluster
+config pins its own `kube_context` inside it, so iris/kubectl operations are
+context-bound per `--cluster` and never depend on the file's current-context
+or an exported `KUBECONFIG`.
+
+| Iris cluster | CW cluster / region | Fleet | Kube context |
+|--------------|---------------------|-------|--------------|
+| `cw-us-east-02a` | `marin-gpu`, US-EAST-02A | 32× 8xH100 + 4× CPU Genoa, pinned warm | `marin-gpu_US-EAST-02A` |
+| `cw-rno2a` | `marin-rn02a`, RNO2A | 64× 8xH100 + 1× CPU Turin, pinned warm | `marin-rn02a_RNO2A` |
 
 Console links:
 - Tokens (kubeconfig): https://console.coreweave.com/tokens
@@ -20,19 +25,22 @@ Console links:
 - Health dashboard: https://cks-grafana.coreweave.com/d/cluster-health/cluster-health?var-cluster-org=208261&var-cluster=marin-gpu&var-region=US-EAST-02
 
 **1. Make a token / kubeconfig.** In the [Tokens console](https://console.coreweave.com/tokens),
-create a token for the cluster and download its kubeconfig.
+create a token and download the kubeconfig — it carries a context per cluster
+(named `<cw-cluster>_<REGION>`).
 
-**2. Install the kubeconfig** at the path from the table above, plus controller
+**2. Install the kubeconfig** at `~/.kube/coreweave-iris`, plus controller
 extras:
 
 ```bash
 mkdir -p ~/.kube
-mv ~/Downloads/kubeconfig.yaml ~/.kube/coreweave-iris-gpu
-export KUBECONFIG=~/.kube/coreweave-iris-gpu
-kubectl cluster-info   # sanity check
+mv ~/Downloads/kubeconfig.yaml ~/.kube/coreweave-iris
+kubectl --kubeconfig ~/.kube/coreweave-iris config get-contexts   # sanity check
 
 uv pip install 'marin-iris[controller]'
 ```
+
+No `KUBECONFIG` export is needed: the cluster configs pin `kubeconfig_path` and
+`kube_context`, and every operation binds to that context explicitly.
 
 That's all a job submitter needs. `CW_KEY_ID` / `CW_KEY_SECRET` (CoreWeave
 Object Storage access keys) are only required when running
@@ -386,11 +394,11 @@ re-run the install after it is Ready.
 
 ### Bringing up a new cluster
 
-1. Download the kubeconfig (§0) to `~/.kube/coreweave-iris-<region>` and export
-   `KUBECONFIG`, `CW_KEY_ID`, `CW_KEY_SECRET`.
+1. Install the kubeconfig (§0) at `~/.kube/coreweave-iris` and export
+   `CW_KEY_ID`, `CW_KEY_SECRET`.
 2. Copy an existing cluster config pair — `lib/iris/config/cw-*.yaml` and
-   `lib/finelog/config/cw-*.yaml` — and adjust region, instance types, and
-   fleet sizes. The console capacity view's display label is NOT the k8s
+   `lib/finelog/config/cw-*.yaml` — and adjust region, `kube_context`,
+   instance types, and fleet sizes. The console capacity view's display label is NOT the k8s
    `spec.instanceType` (e.g. "turin-gp-l4" vs `turin-gp-l`); to probe a SKU,
    create a NodePool with `minNodes: 0, maxNodes: 0, targetNodes: 0` and read
    its `Validated` condition (server dry-run accepts any string).
@@ -433,7 +441,7 @@ auto-tunneled CoreWeave commands fail before connecting:
 Fallback: manual port-forward if you need a long-lived tunnel:
 
 ```bash
-kubectl --kubeconfig ~/.kube/coreweave-iris \
+kubectl --kubeconfig ~/.kube/coreweave-iris --context <kube_context> \
   port-forward -n <namespace> svc/<service_name> 10000:10000 &
 iris --controller-url=http://localhost:10000 ...
 ```
@@ -593,6 +601,7 @@ in `CoreweavePlatform`):
 | `region` | string | — | CoreWeave region (e.g. `RNO2A`) |
 | `namespace` | string | `iris` | Kubernetes namespace for all resources |
 | `kubeconfig_path` | string | — | Only needed when running CLI outside the cluster |
+| `kube_context` | string | — | Kubeconfig context to bind every operation to; empty uses the file's current-context |
 | `object_storage_endpoint` | string | — | S3-compatible endpoint URL |
 
 ### CoreweaveControllerConfig
@@ -738,7 +747,7 @@ The platform detects fatal errors before the full timeout expires:
 
 | Variable | Purpose |
 |----------|---------|
-| `KUBECONFIG` | Path to kubeconfig (alternative to `kubeconfig_path` in config) |
+| `KUBECONFIG` | Overrides the config's `kubeconfig_path` (file only — the config's `kube_context` still binds the context) |
 | `CW_KEY_ID` | S3/CoreWeave Object Storage access key (required if storage uses `s3://`) |
 | `CW_KEY_SECRET` | S3/CoreWeave Object Storage secret key |
 | `CW_ACCESS_KEY_ID` | CoreWeave Object Storage key ID |
@@ -920,9 +929,10 @@ by polling.
 | Kubeconfig file | Operator's kubectl access | Console > Tokens > Download Kubeconfig |
 | CoreWeave Object Storage access key | S3-compatible access to CoreWeave buckets | Console > Object Storage > Access Keys |
 
-The `kubeconfig_path` config field is only needed when running the CLI
-**outside** the cluster (e.g., `iris cluster start` from a laptop). Inside the
-cluster, Pods use in-cluster auth automatically.
+The `kubeconfig_path` / `kube_context` config fields are only needed when
+running the CLI **outside** the cluster (e.g., `iris cluster start` from a
+laptop). Inside the cluster, Pods use in-cluster auth automatically (both
+fields are stripped from the `iris-cluster-config` ConfigMap).
 
 ## 15. Open Questions / Known Limitations
 
