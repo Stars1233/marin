@@ -9,6 +9,7 @@ Run from the repository root:
     uv run pytest tests/integration/iris/test_june_tpu_67b_a2b_checkpoint.py -o addopts= -vv -s
 """
 
+import contextlib
 import dataclasses
 import json
 import logging
@@ -65,7 +66,18 @@ pytestmark = [pytest.mark.integration, pytest.mark.slow, pytest.mark.timeout(PEN
 
 @pytest.fixture
 def marin_gpu_client() -> Iterator[IrisClient]:
-    with open_iris_client(cluster_name=CLUSTER_NAME, workspace=MARIN_ROOT) as client:
+    # This test drives a live CoreWeave GPU node; it can only run where the cluster's
+    # kube credentials are present. In CI (and any workstation without them) opening the
+    # client raises ConfigException, so skip rather than error the whole integration run.
+    # Import kubernetes lazily: it ships with iris[controller] and is absent from the
+    # unit-test env, which still collects (imports) this module before deselecting it.
+    from kubernetes.config.config_exception import ConfigException  # noqa: PLC0415
+
+    with contextlib.ExitStack() as stack:
+        try:
+            client = stack.enter_context(open_iris_client(cluster_name=CLUSTER_NAME, workspace=MARIN_ROOT))
+        except ConfigException as exc:
+            pytest.skip(f"CoreWeave cluster {CLUSTER_NAME!r} unavailable (no kube-config): {exc}")
         yield client
 
 
