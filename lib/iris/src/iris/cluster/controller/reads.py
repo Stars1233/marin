@@ -1850,21 +1850,61 @@ def federated_handle(tx: Tx, job_id: JobName) -> FederatedHandle | None:
     return _sent_handle(row) if row is not None else None
 
 
-def pending_handoff_handles(tx: Tx) -> list[FederatedHandle]:
-    """SENT handles still awaiting delivery: ``PENDING_HANDOFF`` and not cancelled.
+def _uncancelled_sent_handles(tx: Tx, handoff_state: HandoffState) -> list[FederatedHandle]:
+    """SENT handles in ``handoff_state`` whose cancel intent is unset.
 
-    A cancelled pending handoff (``cancel_intent_version > 0``) is excluded so the
-    retry loop never delivers a job the user already asked to cancel.
+    The shared read behind the delivery and promotion queues: a cancelled handle
+    (``cancel_intent_version > 0``) is excluded so neither the retry loop nor the
+    tick's promotion ever acts on a job the user already asked to cancel.
     """
     rows = tx.execute(
         select(*_SENT_HANDLE_COLUMNS).where(
             federated_jobs_table.c.direction == int(FederationDirection.SENT),
-            federated_jobs_table.c.handoff_state == bindparam("pending_state"),
+            federated_jobs_table.c.handoff_state == bindparam("handoff_state"),
             federated_jobs_table.c.cancel_intent_version == 0,
         ),
-        {"pending_state": int(HandoffState.PENDING_HANDOFF)},
+        {"handoff_state": int(handoff_state)},
     ).all()
     return [_sent_handle(r) for r in rows]
+
+
+def pending_handoff_handles(tx: Tx) -> list[FederatedHandle]:
+    """SENT handles still awaiting delivery to the peer: ``PENDING_HANDOFF``, uncancelled.
+
+    Read each sync pass by the retry loop, which (re-)delivers them to the peer.
+    """
+    return _uncancelled_sent_handles(tx, HandoffState.PENDING_HANDOFF)
+
+
+def queued_handoff_handles(tx: Tx) -> list[FederatedHandle]:
+    """SENT handles queued on the parent awaiting a peer with free capacity: uncancelled ``QUEUED_HANDOFF``.
+
+    Read each control tick by the federation pass, which promotes any it can place.
+    """
+    return _uncancelled_sent_handles(tx, HandoffState.QUEUED_HANDOFF)
+
+
+def expired_queued_handoffs(tx: Tx, now_ms: int) -> list[JobName]:
+    """Queued federated jobs whose scheduling deadline has passed, to fail this tick.
+
+    A queued handoff owns no task rows, so the task-level scheduling-timeout scan never
+    sees it; without this a job with a ``scheduling_timeout`` would wait in the queue
+    past its deadline. Returns the nonterminal ``QUEUED_HANDOFF`` jobs whose stored
+    ``scheduling_deadline_epoch_ms`` is set and already elapsed; the tick marks them
+    ``UNSCHEDULABLE``.
+    """
+    rows = tx.execute(
+        select(federated_jobs_table.c.job_id)
+        .select_from(federated_jobs_table.join(jobs_table, federated_jobs_table.c.job_id == jobs_table.c.job_id))
+        .where(
+            federated_jobs_table.c.direction == int(FederationDirection.SENT),
+            federated_jobs_table.c.handoff_state == int(HandoffState.QUEUED_HANDOFF),
+            jobs_table.c.state.notin_(list(TERMINAL_JOB_STATES)),
+            jobs_table.c.scheduling_deadline_epoch_ms.isnot(None),
+            jobs_table.c.scheduling_deadline_epoch_ms < now_ms,
+        )
+    ).all()
+    return [r.job_id for r in rows]
 
 
 def pending_cancel_handles(tx: Tx) -> list[FederatedHandle]:
