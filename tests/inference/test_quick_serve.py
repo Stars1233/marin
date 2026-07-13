@@ -19,14 +19,17 @@ from marin.inference.quick_serve import (
     select_tensor_parallel_size,
     select_vllm_launcher,
 )
-from marin.inference.quick_serve_cli import _mint_and_print_capability_url
+from marin.inference.quick_serve_cli import (
+    _checkout_free_setup_script,
+    _mint_and_print_capability_url,
+)
 from marin.inference.quick_serve_dashboard import (
     ServingInfo,
     bind_serving_socket,
     build_dashboard_app,
     serve_app_background,
 )
-from marin.inference.vllm_server import IsolatedCudaVllm, WorkspaceVllm
+from marin.inference.vllm_server import IsolatedCudaVllm, IsolatedTpuVllm, WorkspaceVllm
 from rigging.timing import Timestamp
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse, PlainTextResponse, StreamingResponse
@@ -68,32 +71,12 @@ def test_resolve_model_path_passthrough(model, ttl_days):
     assert resolve_model_path(model, ttl_days) == model
 
 
-def test_isolated_cuda_vllm_command_pins_version_and_cuda_backend():
-    # The GPU path provisions a stock CUDA vLLM via uvx, keeping its torch/CUDA tree
-    # out of the workspace lock. `[runai]` keeps gs:// checkpoint streaming working.
-    assert IsolatedCudaVllm(version="0.25.0").command() == [
-        "uvx",
-        "--from",
-        "vllm[runai]==0.25.0",
-        "--python",
-        "3.12",
-        "--torch-backend",
-        "cu128",
-        "vllm",
-    ]
-
-
-def test_isolated_cuda_vllm_command_honors_overrides():
-    cmd = IsolatedCudaVllm(version="0.26.0", python_version="3.13", torch_backend="cu130").command()
-    assert "vllm[runai]==0.26.0" in cmd
-    assert cmd[cmd.index("--python") + 1] == "3.13"
-    assert cmd[cmd.index("--torch-backend") + 1] == "cu130"
-
-
-def test_workspace_vllm_command_runs_the_path_vllm():
-    # The TPU path invokes the `vllm` on the venv PATH (or the bare name if unresolved).
-    (binary,) = WorkspaceVllm().command()
-    assert binary.rsplit("/", 1)[-1] == "vllm"
+def test_checkout_free_setup_script_pins_marin_core_with_extras():
+    # The worker install folds the requested extras and the launching CLI's exact version
+    # (for cloudpickle compat) into the pip spec; vLLM stays out — it comes from uvx.
+    script = _checkout_free_setup_script("0.2.44", ("tpu",))
+    assert "marin-core[tpu]==0.2.44" in script
+    assert "vllm" not in script
 
 
 def test_select_vllm_launcher_gpu_provisions_isolated_cuda_vllm():
@@ -112,6 +95,28 @@ def test_select_vllm_launcher_falls_back_to_workspace_without_version():
     )
     assert select_vllm_launcher(tpu) == WorkspaceVllm()
     assert select_vllm_launcher(gpu_with_image) == WorkspaceVllm()
+
+
+def test_select_vllm_launcher_tpu_isolated_from_refs():
+    config = QuickServeConfig(
+        model="Qwen/Qwen3-0.6B",
+        endpoint_name="/serve/x",
+        tpu_type="v6e-8",
+        tpu_vllm_ref="vllm @ git+https://github.com/marin-community/vllm.git@abc",
+        tpu_inference_ref="tpu-inference @ git+https://github.com/marin-community/tpu-inference.git@def",
+    )
+    assert select_vllm_launcher(config) == IsolatedTpuVllm(
+        vllm_ref="vllm @ git+https://github.com/marin-community/vllm.git@abc",
+        tpu_inference_ref="tpu-inference @ git+https://github.com/marin-community/tpu-inference.git@def",
+    )
+
+
+def test_select_vllm_launcher_tpu_ref_requires_tpu_inference():
+    # A vLLM fork without its tpu-inference runtime would boot a broken TPU server; fail
+    # at config time instead.
+    config = QuickServeConfig(model="m", endpoint_name="/serve/x", tpu_type="v6e-8", tpu_vllm_ref="vllm @ git+...@abc")
+    with pytest.raises(ValueError, match="tpu_inference_ref"):
+        select_vllm_launcher(config)
 
 
 def _mint_response(token: str, ttl_hours: float) -> controller_pb2.Controller.MintEndpointTokenResponse:

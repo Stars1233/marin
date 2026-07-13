@@ -14,19 +14,24 @@ Examples::
     marin-serve gs://my-bucket/ckpt --tpu v5litepod-8 --chat-template delphi_v0.jinja2
     marin-serve Qwen/Qwen3-0.6B --cluster marin --gpu H100x8 --target-cluster cw-rno2a
 
-``--gpu`` and ``--tpu`` are mutually exclusive (the default is TPU ``v6e-8``). On the
-GPU path, stock CUDA vLLM is provisioned in an isolated ``uv`` tool env at
-``--vllm-version`` (pinned, overridable) rather than pulled into the workspace lock;
-vLLM is only ever a ``vllm serve`` subprocess, so this keeps its torch/CUDA tree out of
-Marin's resolution. ``--cluster`` selects the controller to submit to; ``--target-cluster``
-federates the job to a named peer. The slice's tensor-parallel size and (for clamped-RoPE
-models) max sequence length are inferred automatically; override with
-``--tensor-parallel-size`` / ``--max-model-len``.
+``--gpu`` and ``--tpu`` are mutually exclusive (the default is TPU ``v6e-8``). The GPU
+path provisions stock CUDA vLLM in an isolated ``uv`` tool env at ``--vllm-version``.
+
+Inside a marin checkout the TPU path serves vLLM from the workspace lock. Outside one it
+serves from an isolated ``uv`` tool env: ``marin-core`` installed from PyPI plus Marin's
+forked TPU vLLM. ``--isolated-vllm`` selects that env inside a checkout too.
+
+``--cluster`` selects the controller to submit to; ``--target-cluster`` federates the job
+to a named peer. The slice's tensor-parallel size and (for clamped-RoPE models) max
+sequence length are inferred automatically; override with ``--tensor-parallel-size`` /
+``--max-model-len``.
 """
 
 import contextlib
+import importlib.metadata
 import logging
 import re
+import shlex
 import time
 import uuid
 from pathlib import Path
@@ -48,10 +53,13 @@ from iris.cluster.types import (
     is_job_finished,
     tpu_device,
 )
+from rigging.config_discovery import find_project_root
 from rigging.connect import capability_path, proxy_path
 from rigging.timing import Duration
 
 from marin.inference.quick_serve import QuickServeConfig, serve_in_job
+from marin.inference.tpu_vllm_pins import tpu_inference_fork_ref, vllm_fork_ref
+from marin.inference.vllm_server import WORKER_PYTHON_VERSION
 
 # vLLM and the dashboard need the generic TPU stack plus the TPU-vLLM runtime.
 _WORKER_EXTRAS = ("tpu", "vllm")
@@ -70,6 +78,27 @@ def _default_job_name(model: str) -> str:
     slug = re.sub(r"[^a-z0-9-]+", "-", model.rsplit("/", 1)[-1].lower()).strip("-")[:24]
     suffix = uuid.uuid4().hex[:6]
     return f"serve-{slug}-{suffix}" if slug else f"serve-{suffix}"
+
+
+def _marin_core_version() -> str:
+    """Installed ``marin-core`` version, used to pin the checkout-free worker install."""
+    return importlib.metadata.version("marin-core")
+
+
+def _checkout_free_setup_script(marin_version: str, extras: tuple[str, ...]) -> str:
+    """Build a fresh venv and install ``marin-core`` from PyPI at ``marin_version``.
+
+    The worker installs the launching CLI's exact ``marin-core`` version so cloudpickled
+    entrypoints stay compatible. ``--torch-backend cpu`` routes torch/torchvision to the
+    CPU PyTorch index (jax and libtpu do TPU compute; torch is only a dependency).
+    """
+    extras_suffix = f"[{','.join(extras)}]" if extras else ""
+    spec = f"marin-core{extras_suffix}=={marin_version}"
+    return (
+        "set -e\n"
+        f'uv venv "$IRIS_VENV" --python {WORKER_PYTHON_VERSION}\n'
+        f'uv pip install --python "$IRIS_VENV" --link-mode symlink --torch-backend cpu {shlex.quote(spec)}\n'
+    )
 
 
 def _resolve_chat_template(spec: str | None) -> str | None:
@@ -150,6 +179,13 @@ def _mint_and_print_capability_url(
     default=None,
     help="Federate the job to this peer cluster (e.g. cw-rno2a). --cluster still selects the controller.",
 )
+@click.option(
+    "--isolated-vllm",
+    is_flag=True,
+    default=False,
+    help="TPU path: provision vLLM from the isolated uvx env (Marin's forked TPU vLLM) "
+    "even inside a checkout. Auto-selected when marin-serve runs outside a checkout.",
+)
 @click.option("--name", default=None, help="Iris job name (default: derived from the model).")
 @click.option("--endpoint-name", default=None, help="Endpoint name to register (default: /serve/<job-name>).")
 @click.option("--chat-template", default=None, help="Jinja chat template: local file path or http(s) URL.")
@@ -209,6 +245,7 @@ def main(
     tpu: str,
     gpu: str | None,
     target_cluster: str | None,
+    isolated_vllm: bool,
     name: str | None,
     endpoint_name: str | None,
     chat_template: str | None,
@@ -235,6 +272,9 @@ def main(
     """Serve MODEL (an HF id or gs:// path) on an Iris TPU or GPU slice."""
     logging.basicConfig(level=logging.INFO, format="[marin-serve] %(message)s")
 
+    # None outside a marin checkout: the TPU path then serves checkout-free.
+    workspace_dir = find_project_root()
+
     tpu_from_cli = click.get_current_context().get_parameter_source("tpu") == ParameterSource.COMMANDLINE
     if gpu is not None and tpu_from_cli:
         raise click.ClickException("--gpu and --tpu are mutually exclusive; pass only one.")
@@ -253,7 +293,14 @@ def main(
 
     endpoint_access = EndpointAccess.Value(f"ENDPOINT_ACCESS_{access.upper()}")
 
+    tpu_vllm_ref: str | None = None
+    tpu_inference_ref: str | None = None
     if gpu is not None:
+        if workspace_dir is None:
+            raise click.ClickException(
+                "marin-serve --gpu serves from a marin checkout (the worker runs marin-core from "
+                "it); none was found. Run marin-serve from inside a marin checkout."
+            )
         try:
             gpu_variant, gpu_count = parse_gpu_spec(gpu)
         except ValueError as exc:
@@ -274,9 +321,17 @@ def main(
         gpu_variant, gpu_count = None, None
         tpu_type = tpu
         device = tpu_device(tpu)
-        worker_extras = (*_WORKER_EXTRAS, *extras)
-        # The TPU path serves from the workspace TPU-vLLM; no isolated env.
         cuda_vllm_version = None
+        # Provision the forked TPU vLLM from an isolated uvx env when there is no checkout
+        # to build it from (or when explicitly requested); otherwise serve the workspace
+        # TPU-vLLM from the lock. The worker venv always needs the `tpu` extra for the
+        # serving glue's jax/libtpu; the `vllm` extra is only for the in-workspace build.
+        if isolated_vllm or workspace_dir is None:
+            tpu_vllm_ref = vllm_fork_ref()
+            tpu_inference_ref = tpu_inference_fork_ref()
+            worker_extras = ("tpu", *extras)
+        else:
+            worker_extras = (*_WORKER_EXTRAS, *extras)
 
     config = QuickServeConfig(
         model=model,
@@ -297,7 +352,16 @@ def main(
         vllm_startup_timeout_seconds=int(wait_timeout),
         extra_vllm_args=tuple(vllm_args),
         vllm_version=cuda_vllm_version,
+        tpu_vllm_ref=tpu_vllm_ref,
+        tpu_inference_ref=tpu_inference_ref,
     )
+
+    # No checkout to bundle → install marin-core from PyPI on the worker (checkout-free
+    # TPU path); otherwise sync the bundled workspace with the resolved extras.
+    if workspace_dir is None:
+        environment = EnvironmentSpec(setup_scripts=[_checkout_free_setup_script(_marin_core_version(), worker_extras)])
+    else:
+        environment = EnvironmentSpec(extras=worker_extras)
 
     constraints: list[Constraint] = []
     if region:
@@ -312,12 +376,12 @@ def main(
         controller_url = endpoint_info.url
         dashboard_url = endpoint_info.config.dashboard_url if endpoint_info.config else None
         click.echo(f"Using controller {controller_url}")
-        with IrisClient.remote(controller_url, workspace=Path.cwd(), credentials=endpoint_info.credentials) as client:
+        with IrisClient.remote(controller_url, workspace=workspace_dir, credentials=endpoint_info.credentials) as client:
             job = client.submit(
                 entrypoint=Entrypoint.from_callable(serve_in_job, config),
                 name=job_name,
                 resources=ResourceSpec(cpu=cpu, memory=memory, disk=disk, device=device),
-                environment=EnvironmentSpec(extras=worker_extras),
+                environment=environment,
                 ports=["http"],
                 constraints=constraints or None,
                 max_retries_failure=0,
