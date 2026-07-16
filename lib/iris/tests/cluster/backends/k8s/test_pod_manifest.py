@@ -15,6 +15,8 @@ from iris.cluster.backends.k8s.tasks import (
     _KUEUE_PRIORITY_CLASS,
     _KUEUE_QUEUE_NAME,
     _KUEUE_REQUIRED_TOPOLOGY,
+    _KUEUE_SLICE_REQUIRED_TOPOLOGY,
+    _KUEUE_SLICE_SIZE,
     _LABEL_JOB_ID,
     _LABEL_TASK_HASH,
     _build_init_container_spec,
@@ -34,7 +36,13 @@ from iris.cluster.backends.k8s.tasks import (
     _task_update_from_pod,
 )
 from iris.cluster.controller.task_state import RunningTaskEntry
-from iris.cluster.platforms.k8s.coreweave_topology import RACK_SIZE
+from iris.cluster.platforms.k8s.coreweave_topology import (
+    NVL72_GPUS_PER_NODE,
+    RACK_SIZE,
+    SCHEDULABLE_RACK_NODES,
+    KueueTopologyBinding,
+    TopologyMode,
+)
 from iris.cluster.platforms.k8s.types import parse_k8s_quantity
 from iris.cluster.types import JobName
 from iris.rpc import job_pb2
@@ -1087,21 +1095,23 @@ def test_kueue_required_topology_for_nvlink_domain():
     assert _KUEUE_PREFERRED_TOPOLOGY not in annotations
 
 
-def test_kueue_required_nvlink_gang_rejects_more_than_one_rack():
-    """A hard nvlink.domain gang cannot span racks: one NVL72 rack is one NVLink domain of
-    RACK_SIZE nodes, so a required gang larger than that is unschedulable and must fail fast
-    (the guard for the programmatic client; the CLI already caps NVLink gangs at RACK_SIZE)."""
-    with pytest.raises(ValueError, match="NVLink domain size"):
+def test_kueue_required_nvlink_gang_rejects_above_schedulable_slice():
+    """A hard nvlink.domain gang larger than a rack's guaranteed-schedulable slice can hang
+    whenever the rack is short a node, so it must fail fast (the guard for a programmatic or
+    stale client; the CLI routes 17+ NVL72 replicas to the sliced level, never to a hard gang
+    this large)."""
+    with pytest.raises(ValueError, match="guaranteed-schedulable rack slice"):
         _build_pod_manifest(
-            _cosched_req("/job/task/0", num_tasks=RACK_SIZE + 1, group_by="nvlink.domain"),
+            _cosched_req("/job/task/0", num_tasks=SCHEDULABLE_RACK_NODES + 1, group_by="nvlink.domain"),
             pod_config(local_queue="iris-lq"),
         )
 
 
-def test_kueue_required_nvlink_gang_allows_full_rack():
-    """A hard nvlink.domain gang of exactly one full rack (RACK_SIZE nodes) is valid."""
+def test_kueue_required_nvlink_gang_allows_schedulable_slice():
+    """A hard nvlink.domain gang of exactly the guaranteed-schedulable rack slice
+    (SCHEDULABLE_RACK_NODES nodes) is the largest hard single-domain gang and is valid."""
     manifest = _build_pod_manifest(
-        _cosched_req("/job/task/0", num_tasks=RACK_SIZE, group_by="nvlink.domain"),
+        _cosched_req("/job/task/0", num_tasks=SCHEDULABLE_RACK_NODES, group_by="nvlink.domain"),
         pod_config(local_queue="iris-lq"),
     )
     assert manifest["metadata"]["annotations"][_KUEUE_REQUIRED_TOPOLOGY] == "ds.coreweave.com/nvlink.domain"
@@ -1119,6 +1129,75 @@ def test_kueue_preferred_nvlink_gang_packs_multi_rack():
     annotations = manifest["metadata"]["annotations"]
     assert annotations[_KUEUE_PREFERRED_TOPOLOGY] == "ds.coreweave.com/nvlink.domain"
     assert _KUEUE_REQUIRED_TOPOLOGY not in annotations
+
+
+def _sliced_req(
+    task_id: str, num_tasks: int, *, gpu_count: int = NVL72_GPUS_PER_NODE, group_by: str = "nvlink.domain.sliced"
+):
+    """A coscheduled request on the sliced level with a GB200 GPU device (node-saturating by default)."""
+    req = _cosched_req(task_id, num_tasks=num_tasks, group_by=group_by)
+    req.resources.device.gpu.CopyFrom(job_pb2.GpuDevice(variant="GB200", count=gpu_count))
+    return req
+
+
+@pytest.mark.parametrize("num_tasks,slice_size", [(24, 12), (32, 16), (48, 16), (20, 10), (64, 16)])
+def test_kueue_sliced_nvlink_gang_stamps_balanced_slice_size(num_tasks, slice_size):
+    """A multi-rack GB200 gang on the sliced level binds podset-slice-required-topology to
+    nvlink.domain with a podset-slice-size that spreads it evenly over the fewest racks (24->12,
+    32->16, 48->16), pairs a soft coarse leafgroup preference, and stamps the per-pod index that
+    makes slice membership rank-contiguous. It carries neither the whole-podset required nor a
+    preferred nvlink.domain request."""
+    manifest = _build_pod_manifest(_sliced_req("/job/task/0", num_tasks=num_tasks), pod_config(local_queue="iris-lq"))
+    annotations = manifest["metadata"]["annotations"]
+    assert annotations[_KUEUE_SLICE_REQUIRED_TOPOLOGY] == "ds.coreweave.com/nvlink.domain"
+    assert annotations[_KUEUE_SLICE_SIZE] == str(slice_size)
+    assert annotations[_KUEUE_PREFERRED_TOPOLOGY] == "backend.coreweave.cloud/leafgroup"
+    assert _KUEUE_REQUIRED_TOPOLOGY not in annotations
+    assert manifest["metadata"]["labels"][_KUEUE_POD_GROUP_POD_INDEX] == "0"
+
+
+def test_kueue_sliced_gang_rejects_uneven_split():
+    """A sliced gang that cannot split into equal per-rack slices (17 over ceil(17/16)=2 racks)
+    can't place as a balanced layout, so it is rejected at build time."""
+    with pytest.raises(ValueError, match="do not divide evenly"):
+        _build_pod_manifest(_sliced_req("/job/task/0", num_tasks=17), pod_config(local_queue="iris-lq"))
+
+
+def test_kueue_sliced_gang_rejects_slice_too_small():
+    """A gang whose balanced slices would each be <= half a rack (18 -> two 9-node slices) lets
+    two slices share one rack, breaking one slice per rack, so it is rejected."""
+    with pytest.raises(ValueError, match="must exceed half a rack"):
+        _build_pod_manifest(_sliced_req("/job/task/0", num_tasks=18), pod_config(local_queue="iris-lq"))
+
+
+def test_kueue_sliced_gang_requires_node_saturating_pods():
+    """The one-slice-per-rack guarantee holds only if each pod fills a whole node; a sub-node
+    GB200 pod would let two slices share a rack, so the sliced level rejects it."""
+    with pytest.raises(ValueError, match="node-saturating"):
+        _build_pod_manifest(
+            _sliced_req("/job/task/0", num_tasks=32, gpu_count=1),
+            pod_config(local_queue="iris-lq"),
+        )
+
+
+def test_kueue_sliced_gang_without_coarse_preferred_omits_preferred_annotation():
+    """A sliced binding whose coarse_preferred_label is unset stamps only the slice request, no
+    whole-podset preferred topology."""
+    manifest = _build_pod_manifest(
+        _sliced_req("/job/task/0", num_tasks=32),
+        pod_config(
+            local_queue="iris-lq",
+            kueue_topologies={
+                "nvlink.domain.sliced": KueueTopologyBinding(
+                    "ds.coreweave.com/nvlink.domain", TopologyMode.SLICE_REQUIRED
+                )
+            },
+        ),
+    )
+    annotations = manifest["metadata"]["annotations"]
+    assert annotations[_KUEUE_SLICE_REQUIRED_TOPOLOGY] == "ds.coreweave.com/nvlink.domain"
+    assert annotations[_KUEUE_SLICE_SIZE] == "16"
+    assert _KUEUE_PREFERRED_TOPOLOGY not in annotations
 
 
 def test_kueue_preferred_topology_for_leafgroup():
@@ -1223,7 +1302,10 @@ def test_kueue_topologies_override_config():
     """A configured topologies mapping overrides the CoreWeave defaults for a group_by."""
     manifest = _build_pod_manifest(
         _cosched_req("/job/task/0", group_by="leafgroup"),
-        pod_config(local_queue="iris-lq", kueue_topologies={"leafgroup": ("rack.example.com/pod", True)}),
+        pod_config(
+            local_queue="iris-lq",
+            kueue_topologies={"leafgroup": KueueTopologyBinding("rack.example.com/pod", TopologyMode.REQUIRED)},
+        ),
     )
     annotations = manifest["metadata"]["annotations"]
     assert annotations[_KUEUE_REQUIRED_TOPOLOGY] == "rack.example.com/pod"

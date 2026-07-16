@@ -31,6 +31,7 @@ from rigging.filesystem import StoragePath
 from rigging.secrets import as_secret_spec, is_secret_reference, resolve_secret_spec
 from rigging.timing import Duration
 
+from iris.cluster.platforms.k8s.coreweave_topology import TopologyMode
 from iris.cluster.tpu_topology import TPU_FAMILY_VARIANT_PREFIX, get_tpu_topology, tpu_variant_name
 from iris.cluster.types import (
     AUTO_DEVICE_VARIANT,
@@ -593,7 +594,8 @@ class WorkerProviderConfig(_Config):
 
 class KueueTopology(_Config):
     node_label: str = ""
-    required: bool = False  # True => required-topology (hard); False => preferred
+    mode: TopologyMode = TopologyMode.PREFERRED  # preferred (soft) / required (hard) / slice
+    coarse_preferred_label: str = ""  # optional soft coarse pairing for a sliced binding
 
 
 class KueueConfig(_Config):
