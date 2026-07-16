@@ -30,7 +30,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .june_67b_a2b import InferenceGolden, read_inference_golden
+from tests.cluster.vllm.june_67b_a2b import InferenceGolden, read_inference_golden
 
 _RESOURCES = Path(__file__).parent / "resources"
 

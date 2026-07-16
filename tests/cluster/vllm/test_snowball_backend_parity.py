@@ -20,8 +20,11 @@ levanter reference, Snowball is a levanter reimplementation of it (only bf16 noi
 and vLLM is a different framework serving the same weights (it diverges more on higher-entropy
 prompts, though the greedy token still matches exactly everywhere).
 
-Run from the repository root:
-    uv run pytest tests/vllm/e2e/test_snowball_backend_parity.py -o addopts= -vv -s
+Marked ``cluster`` (submits H100 jobs to the standing CoreWeave cluster) so it is deselected by
+default; the ``marin-cluster-smoke`` workflow runs it. Launch it on demand with::
+
+    uv run pytest tests/cluster/vllm/test_snowball_backend_parity.py \
+      -m cluster -o addopts= --import-mode=importlib -vv -s
 """
 
 import logging
@@ -37,7 +40,7 @@ from iris.client import IrisClient
 from iris.cluster.setup_scripts import default_setup_script
 from iris.rpc import job_pb2
 
-from .backend_parity import (
+from tests.cluster.vllm.backend_parity import (
     LEVANTER_MAX_PROBABILITY_ERROR,
     VLLM_MAX_PROBABILITY_ERROR,
     NextTokenParity,
@@ -45,8 +48,7 @@ from .backend_parity import (
     parity_from_logprob_row,
     read_golden_set,
 )
-from .june_67b_a2b import JUNE_67B_A2B, InferenceGolden
-from .remote_job import run_remote_test_job
+from tests.cluster.vllm.june_67b_a2b import JUNE_67B_A2B, InferenceGolden
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +63,7 @@ PAD_LEN = 16
 PAD_TOKEN_ID = 0
 LEVANTER_CACHE = "s3://marin-us-east-02a/tmp/ttl=30d/compilation-cache/snowball-67b-a2b-step-42150-parity-v1"
 
-pytestmark = [pytest.mark.integration, pytest.mark.slow, pytest.mark.timeout(PENDING_TIMEOUT + RUNTIME_TIMEOUT + 60)]
+pytestmark = [pytest.mark.cluster, pytest.mark.slow, pytest.mark.timeout(PENDING_TIMEOUT + RUNTIME_TIMEOUT + 60)]
 
 
 # TODO(#7135): drop this overlay for marin-core[vllm-gpu] once #7134 provides the managed baseline.
@@ -250,10 +252,11 @@ def test_snowball_backend_matches_grug_goldens(
     marin_gpu_client: IrisClient,
     backend: str,
     vllm_attention_backend: str,
+    run_test_job,
 ) -> None:
     goldens = read_golden_set()
     request = _levanter_job(goldens) if backend == "levanter-gpu" else _vllm_job(goldens, vllm_attention_backend)
-    run_remote_test_job(
+    run_test_job(
         marin_gpu_client,
         request,
         pending_timeout=PENDING_TIMEOUT,

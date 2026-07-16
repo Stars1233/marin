@@ -17,8 +17,11 @@ greedy token matches exactly, and the probability error on the golden's token se
 ``MAX_PROBABILITY_ERROR`` — a tie-insensitive bar. The export already has the pending QB betas baked
 into ``router.bias``, so Snowball loads them as-is (no re-application).
 
-Run from the repository root:
-    uv run pytest tests/vllm/e2e/test_snowball_67b_hf_logits.py -o addopts= -vv -s
+Marked ``cluster`` (submits an H100 job to the standing CoreWeave cluster) so it is deselected by
+default; the ``marin-cluster-smoke`` workflow runs it. Launch it on demand with::
+
+    uv run pytest tests/cluster/vllm/test_snowball_67b_hf_logits.py \
+      -m cluster -o addopts= --import-mode=importlib -vv -s
 """
 
 import dataclasses
@@ -41,9 +44,8 @@ from levanter.models.snowball import SnowballLMHeadModel
 from levanter.tokenizers import load_tokenizer
 from levanter.utils.jax_utils import parameter_count
 
-from .backend_parity import LEVANTER_MAX_PROBABILITY_ERROR, parity_from_logprob_row
-from .june_67b_a2b import JUNE_67B_A2B, InferenceGolden, read_inference_golden
-from .remote_job import run_remote_test_job
+from tests.cluster.vllm.backend_parity import LEVANTER_MAX_PROBABILITY_ERROR, parity_from_logprob_row
+from tests.cluster.vllm.june_67b_a2b import JUNE_67B_A2B, InferenceGolden, read_inference_golden
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +56,7 @@ JAX_COMPILATION_CACHE_DIR = (
     "s3://marin-us-east-02a/tmp/ttl=30d/compilation-cache/snowball-67b-a2b-step-42150-sonic-deterministic-v1"
 )
 
-pytestmark = [pytest.mark.integration, pytest.mark.slow, pytest.mark.timeout(PENDING_TIMEOUT + RUNTIME_TIMEOUT + 60)]
+pytestmark = [pytest.mark.cluster, pytest.mark.slow, pytest.mark.timeout(PENDING_TIMEOUT + RUNTIME_TIMEOUT + 60)]
 
 
 def assert_snowball_hf_export_matches_golden(golden: InferenceGolden) -> None:
@@ -124,9 +126,9 @@ def assert_snowball_hf_export_matches_golden(golden: InferenceGolden) -> None:
         parity.assert_matches(max_probability_error=LEVANTER_MAX_PROBABILITY_ERROR)
 
 
-def test_snowball_h100_hf_export_matches_golden(marin_gpu_client: IrisClient) -> None:
+def test_snowball_h100_hf_export_matches_golden(marin_gpu_client: IrisClient, run_test_job) -> None:
     golden = read_inference_golden(JUNE_67B_A2B.inference_golden_path)
-    run_remote_test_job(
+    run_test_job(
         marin_gpu_client,
         JobRequest(
             name=f"snowball-67b-hf-logits-{uuid.uuid4().hex[:8]}",
