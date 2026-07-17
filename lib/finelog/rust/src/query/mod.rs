@@ -1,7 +1,7 @@
 //! DataFusion read engine.
 //!
 //! `make_ctx()` builds a `SessionContext` configured to match DuckDB's result
-//! shape (Utf8 strings, DuckDB parsing dialect) with the compat UDFs registered.
+//! shape (Utf8 strings, DuckDB parsing dialect) with the scalar UDFs registered.
 //! `run_query_over()` registers every live namespace as a `TableProvider`, runs
 //! the user SQL under a SELECT-only gate (see `read_only_sql_options`), collects
 //! the result, and deregisters — the body of the `StatsService::Query` handler.
@@ -135,11 +135,12 @@ fn shared_runtime_env() -> Arc<RuntimeEnv> {
 ///   DuckDB's late materialization reads zero blobs for a non-matching key. This
 ///   is the dominant cost in the dashboard's profile-history query.
 ///
-/// The compat UDFs (`prefix`/`regexp_matches`/`contains`) are registered so the
-/// corpus and FetchLogs resolve them, and the [`PrefixRangeRewrite`] analyzer
-/// rule rewrites starts-with predicates to expose a prunable key range to the
-/// planner (so both FetchLogs and the generic Query API prune row groups on the
-/// `[key, seq]`-sorted segments — see [`crate::query::optimizer`]).
+/// The scalar UDFs (`prefix`/`regexp_matches`/`contains` and the `json_*`
+/// extraction family — see [`crate::query::udf`]) are registered so the corpus,
+/// FetchLogs, and JSON-label queries resolve them, and the [`PrefixRangeRewrite`]
+/// analyzer rule rewrites starts-with predicates to expose a prunable key range
+/// to the planner (so both FetchLogs and the generic Query API prune row groups
+/// on the `[key, seq]`-sorted segments — see [`crate::query::optimizer`]).
 ///
 /// The context runs on a shared, memory-bounded `RuntimeEnv` (see
 /// [`shared_runtime_env`]) so a pathological query fails cleanly rather than
@@ -152,7 +153,7 @@ pub fn make_ctx() -> SessionContext {
     cfg.options_mut().execution.parquet.reorder_filters = true;
     let ctx = SessionContext::new_with_config_rt(cfg, shared_runtime_env());
     ctx.add_analyzer_rule(Arc::new(crate::query::optimizer::PrefixRangeRewrite));
-    udf::register_compat_udfs(&ctx);
+    udf::register_scalar_udfs(&ctx);
     ctx
 }
 
