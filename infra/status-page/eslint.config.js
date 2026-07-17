@@ -35,6 +35,16 @@ export default tseslint.config(
     },
   },
   {
+    files: ["tests/**/*.ts"],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: "module",
+      globals: {
+        ...globals.node,
+      },
+    },
+  },
+  {
     // PostCSS / build-tool configs that still live on CommonJS.
     files: ["**/*.cjs"],
     languageOptions: {

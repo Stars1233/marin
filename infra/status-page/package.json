@@ -10,8 +10,10 @@
     "build": "npm run build:web && npm run build:server",
     "build:web": "vite build",
     "build:server": "tsc -p tsconfig.server.json",
-    "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.web.json --noEmit",
+    "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.web.json --noEmit && tsc -p tsconfig.test.json",
     "lint": "eslint .",
+    "test": "npm run test:server",
+    "test:server": "tsx --test tests/server/*.test.ts",
     "start": "node server/dist/main.js"
   },
   "dependencies": {
