@@ -24,6 +24,7 @@ import dataclasses
 
 import pytest
 from iris.client import IrisClient
+from levanter.optim.config import AdamConfig
 from marin.execution.lazy import lower
 from marin.execution.step_runner import StepRunner
 
@@ -54,14 +55,24 @@ _SMOKE_DATA = DatasetSpec(
 SMOKE_SPEC = SFTSpec(
     name="checkpoints/smoke-sft-tpu-qwen3-0p6b",
     version="2026.07.15-dev",  # -dev = always rebuild (no cache reuse)
-    model=HFModel("Qwen/Qwen3-0.6B"),  # tiny public Qwen3, used verbatim -> initialize_from_hf
+    # tiny public Qwen3, used verbatim -> initialize_from_hf; Qwen3 eos = <|endoftext|> + <|im_end|>.
+    model=HFModel("Qwen/Qwen3-0.6B", eos_token_ids=(151643, 151645)),
     chat_template=QWEN3_SMOKE_CHAT_TEMPLATE,
     datasets=[_SMOKE_DATA],
+    optimizer=AdamConfig(
+        learning_rate=1e-5,
+        beta1=0.9,
+        beta2=0.98,
+        epsilon=1e-8,
+        max_grad_norm=1.0,
+        weight_decay=0.0,
+        lr_schedule="cosine",
+        warmup=0.1,
+        min_lr_ratio=0.0,
+    ),
     seq_len=1024,
-    lr=1e-5,
     batch_size=8,
     num_train_steps=20,  # a handful of steps -> HF export at step 20
-    eos_token_ids=(151643, 151645),  # Qwen3: <|endoftext|> + <|im_end|>
     wandb_project="marin-sft-launcher-smoke",
 )
 
