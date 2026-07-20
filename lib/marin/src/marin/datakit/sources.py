@@ -22,6 +22,7 @@ from marin.datakit.download.biocollection import biocollection_normalize_steps
 from marin.datakit.download.biodiversity import biodiversity_normalize_steps
 from marin.datakit.download.climblab_ja import climblab_ja_normalize_steps
 from marin.datakit.download.coderforge import coderforge_normalize_steps
+from marin.datakit.download.common_crawl_focus import common_crawl_focus_normalize_steps
 from marin.datakit.download.common_pile import common_pile_normalize_steps
 from marin.datakit.download.davinci_dev import (
     davinci_dev_ctx_native_normalize_steps,
@@ -151,6 +152,7 @@ def all_sources() -> dict[str, DatakitSource]:
         ("cp/biodiversity", biodiversity_normalize_steps, 8.60),
         ("climblab-ja", climblab_ja_normalize_steps, 371.92),
         ("coderforge", coderforge_normalize_steps, 10.29),
+        ("common-crawl-focus-2026-22", common_crawl_focus_normalize_steps, 49.702569456),
         ("davinci-dev/ctx-native", davinci_dev_ctx_native_normalize_steps, 57.57),
         ("davinci-dev/env-native", davinci_dev_env_native_normalize_steps, 2.58),
         ("eai-taxonomy-code-w-dclm", eai_taxonomy_code_normalize_steps, 591.90),
