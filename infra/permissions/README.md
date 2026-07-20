@@ -12,6 +12,17 @@ The Ducky account also receives `roles/iam.serviceAccountTokenCreator` from the 
 GitHub subject. Rigging needs it to mint the service-account ID token accepted by Iris's IAP
 edge; Grafana does not mint IAP tokens and does not receive that role.
 
+The Grafana deploy account can list Secret Manager metadata for its optional-secret probe. A
+custom role lets it manage IAM policies on the four secrets wired into Cloud Run without
+reading their payloads; the role is granted only on those secret resources. It can upload
+images only to the `marin-grafana` Artifact Registry repository. A separate custom role lets
+it read and update IAP policies on web services without granting access to those services or
+control over IAP tunnels.
+
+The secret IAM list is an explicit permission allowlist rather than a value derived from the
+Grafana deployment. A newly wired runtime secret therefore fails closed until its deploy-account
+IAM management is reviewed here.
+
 ## Apply
 
 Select the existing stack and review its plan before applying changes:
@@ -33,9 +44,8 @@ pulumi stack init hai-gcp-models \
   --secrets-provider=gcpkms://projects/hai-gcp-models/locations/us-central1/keyRings/marin-iac-keyring/cryptoKeys/marin-iac-key
 ```
 
-A normal preview is a no-op. Recreating the stack should produce exactly seven IAM members:
-WIF impersonation, state-bucket object admin, and KMS encrypt/decrypt for each deployment
-account, plus ID-token minting for Ducky. Any other IAM change is unexpected.
+A normal preview is a no-op. Review every create or update before applying because this stack
+controls deployment identities and access to shared state, KMS, and service secrets.
 
 The shared bucket and key are a deliberate trust boundary: either deploy account can access
 state from other projects in the backend. Splitting state prefixes and keys requires a separate

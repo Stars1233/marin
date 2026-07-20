@@ -5,12 +5,18 @@
 
 import pulumi
 import pulumi_gcp as gcp
-from iac.gcp.permissions import GcpDeployPermissions, GcpDeployPermissionsArgs
+from iac.gcp.permissions import (
+    GcpArtifactRegistryGrant,
+    GcpDeployAccount,
+    GcpDeployPermissions,
+    GcpDeployPermissionsArgs,
+)
 
 
 def main() -> None:
     config = pulumi.Config()
     project = config.require("project")
+    deploy_accounts = config.require_object("deploy_accounts")
     provider = gcp.Provider("gcp", project=project)
     GcpDeployPermissions(
         "deploy",
@@ -23,8 +29,23 @@ def main() -> None:
             kms_location=config.require("kms_location"),
             kms_key_ring=config.require("kms_key_ring"),
             kms_key=config.require("kms_key"),
-            service_accounts=tuple(config.require_object("deploy_service_accounts")),
-            id_token_service_accounts=frozenset(config.get_object("id_token_service_accounts") or []),
+            accounts=tuple(
+                GcpDeployAccount(
+                    service_account=account["service_account"],
+                    mint_id_tokens=account.get("mint_id_tokens", False),
+                    secret_metadata_viewer=account.get("secret_metadata_viewer", False),
+                    secret_iam_secrets=tuple(account.get("secret_iam_secrets", [])),
+                    artifact_registry_grants=tuple(
+                        GcpArtifactRegistryGrant(
+                            location=grant["location"],
+                            repositories=tuple(grant["repositories"]),
+                        )
+                        for grant in account.get("artifact_registry_grants", [])
+                    ),
+                    iap_iam_manager=account.get("iap_iam_manager", False),
+                )
+                for account in deploy_accounts
+            ),
         ),
         gcp_provider=provider,
     )
