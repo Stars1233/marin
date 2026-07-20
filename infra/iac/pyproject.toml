@@ -8,7 +8,9 @@ version = "0.0.0"
 description = "Infrastructure-as-code for Marin clusters."
 requires-python = ">=3.12"
 dependencies = [
-    "marin-iris",
+    # [controller] for iris.cluster.platforms.k8s.service.CloudK8sService, used by
+    # scripts/verify_no_drift.py to list NodePools/Nodes without reinventing kubectl+JSON.
+    "marin-iris[controller]",
     "marin-rigging",
 ]
 

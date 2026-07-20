@@ -26,7 +26,7 @@ import httpx
 from connectrpc.code import Code
 from connectrpc.errors import ConnectError
 from google.protobuf import json_format
-from iris.cli.connect import open_controller_endpoint
+from iris.cli.connect import connect_controller
 from iris.client.client import IrisClient, Job
 from iris.cluster.constraints import region_constraint
 from iris.cluster.types import Entrypoint, EnvironmentSpec, JobName, ResourceSpec, is_job_finished
@@ -182,7 +182,7 @@ def _deploy(spec: ServiceSpec) -> None:
     run_build_commands(workspace, spec.build_commands)
     check_bundle_includes(workspace, spec.extra_bundle_includes)
     env_vars = resolve_env(spec)
-    with open_controller_endpoint(cluster_name=spec.cluster) as endpoint:
+    with connect_controller(cluster_name=spec.cluster) as endpoint:
         with IrisClient.remote(
             endpoint.url,
             workspace=workspace,
@@ -249,7 +249,7 @@ def terminate_service(client: IrisClient, job_id: JobName, *, wait: float = TERM
 def down(spec_file: str | None) -> None:
     """Terminate the service job (idempotent; runs on resource removal and destroy)."""
     spec = load_spec(spec_file)
-    with open_controller_endpoint(cluster_name=spec.cluster) as endpoint:
+    with connect_controller(cluster_name=spec.cluster) as endpoint:
         with IrisClient.remote(endpoint.url, workspace=None, credentials=endpoint.credentials) as client:
             terminate_service(client, JobName.root(spec.user, spec.name))
 

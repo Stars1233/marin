@@ -142,7 +142,7 @@ Three levels, no paid CoreWeave in the default path:
   most important regression, since an unscoped webhook deadlocks node delivery cluster-wide.
 - **kind**: the k8s-portable components (`KueueAddon` upstream variant, `IrisRbac`) apply
   against a kind cluster, reusing the existing `tests/e2e/gpu_gang_smoke.py` harness path.
-- **Greenfield rollout check** (the acceptance test): on `ci-coreweave`, `infra/iac` apply
+- **Greenfield rollout check** (the acceptance test): on `cw-us-west-04a`, `infra/iac` apply
   provisions RBAC + Kueue + Traefik + NodePools, then `iris cluster start` succeeds against
   those prerequisites **without** its own `ensure_rbac()`/`ensure_nodepools()`, and a CPU
   hello-world + 8-GPU `jax.devices()` job run. Proves the cede boundary end-to-end.
@@ -171,10 +171,14 @@ IAM split, secrets model, and CD gate are pinned in `spec.md §9`.
 
 ## Open Questions
 
-- **CoreWeave declarative coverage.** How much of CKS (esp. *cluster* creation vs just
-  NodePools/add-ons) is robust through the CW Terraform provider bridged into Pulumi at our
-  fleet sizes? If `coreweave_cks_cluster` create/update proves weak, do we start IaC at the
-  NodePool/add-on layer and leave cluster-create a documented console step until it matures?
+- **CoreWeave declarative coverage — resolved.** IaC starts at the NodePool/add-on layer;
+  `coreweave_cks_cluster` create/adopt is not built. Bridging the CoreWeave Terraform provider
+  into Pulumi needs CoreWeave API credentials, which we do not have; without the bridge Pulumi
+  has no resource type for the CKS cluster object, so it cannot even be *adopted* into state
+  (import needs a provider, same as create). `CoreweaveCluster` records the cluster as external
+  config (`CksClusterSpec`, exported as plain outputs); cluster-create stays a console step.
+  Revisit if CoreWeave API credentials get provisioned and the bridge is worth its maintenance
+  cost — we manage only the NodePools, so provider coverage of cluster-create is the open unknown.
 - **Verification strictness.** How strict should `iris cluster start`'s new prerequisite
   check be — exact-match on NodePool specs/RBAC verbs (catches drift, brittle across Iris
   versions) or presence-only (tolerant, misses drift)? This defines the portability contract's
