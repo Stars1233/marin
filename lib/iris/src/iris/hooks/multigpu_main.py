@@ -3,12 +3,18 @@
 
 """Per-node multi-process supervisor: run one JAX process per device group.
 
-``python -m iris.cluster.hooks.multigpu_main --nproc N [--devices-per-proc D] -- <argv>``
+``python -m iris.hooks.multigpu_main --nproc N [--devices-per-proc D] [--wrap 'CMD'] -- <argv>``
 spawns N copies of ``<argv>`` inside a single Iris task, each pinned to a
 contiguous group of D local accelerator devices. It is the GPU analogue of
 ``srun``/``torchrun`` scoped to one host: the children share the pod's IPC
 namespace and ``/dev/shm``, so NCCL keeps the intra-node NVLink P2P that
 separate single-GPU pods cannot use.
+
+Invoked by the caller (or a launcher) as part of the command — iris is a dumb
+scheduler and does not inject it. ``--wrap 'CMD'`` prefixes each child with a
+wrapper (e.g. ``python -m iris.hooks.nsys_main --tasks first``) so a per-process
+profiler sees each child's own ``IRIS_MULTIGPU_PROCESS_INDEX``; a whole-task
+wrapper is composed outside this process instead.
 
 Each child inherits the supervisor's environment plus its rank::
 
@@ -17,9 +23,9 @@ Each child inherits the supervisor's environment plus its rank::
     IRIS_MULTIGPU_LOCAL_DEVICE_IDS = the child's D device ids     ("0", or "2,3")
 
 ``iris.runtime.jax_init.initialize_jax`` reads these (their names are the contract
-defined in the sibling :mod:`iris.cluster.hooks.multigpu` spec) and joins the JAX
-mesh. The names are iris-private (not the JAX_*/framework namespace) so a job that
-already sets JAX rank vars never trips the supervised path.
+this module defines) and joins the JAX mesh. The names are iris-private (not the
+JAX_*/framework namespace) so a job that already sets JAX rank vars never trips
+the supervised path.
 
 The supervisor owns child lifecycle: it forwards SIGINT/SIGTERM to every child,
 tears the group down and exits non-zero if any child fails, and prefixes each
@@ -31,6 +37,7 @@ no CUDA context exists in the supervisor's address space.
 import argparse
 import logging
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -40,7 +47,7 @@ from types import FrameType
 from rigging.timing import Deadline, Duration
 
 from iris.cluster.client.job_info import get_job_info
-from iris.cluster.hooks.multigpu import (
+from iris.hooks.multigpu import (
     IRIS_MULTIGPU_LOCAL_DEVICE_IDS_ENV,
     IRIS_MULTIGPU_PROCESS_COUNT_ENV,
     IRIS_MULTIGPU_PROCESS_INDEX_ENV,
@@ -238,17 +245,29 @@ def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     if "--" not in raw:
         raise SystemExit(
-            "usage: python -m iris.cluster.hooks.multigpu_main --nproc N [--devices-per-proc D] -- <command...>"
+            "usage: python -m iris.hooks.multigpu_main --nproc N [--devices-per-proc D] "
+            "[--wrap 'CMD'] -- <command...>"
         )
     split = raw.index("--")
     own_args, child_argv = raw[:split], raw[split + 1 :]
 
-    parser = argparse.ArgumentParser(prog="python -m iris.cluster.hooks.multigpu_main")
+    parser = argparse.ArgumentParser(prog="python -m iris.hooks.multigpu_main")
     parser.add_argument("--nproc", type=int, required=True, help="number of processes to launch on this host")
     parser.add_argument(
         "--devices-per-proc", type=int, default=1, help="local accelerator devices assigned to each process"
     )
+    parser.add_argument(
+        "--wrap",
+        default=None,
+        help="wrap each child in this command (e.g. 'python -m iris.hooks.nsys_main --tasks first') — for "
+        "per-process profiling, where the wrapper sees each child's own IRIS_MULTIGPU_PROCESS_INDEX",
+    )
     args = parser.parse_args(own_args)
+    # A per-child wrapper (process-scope) goes *inside* the supervisor: each child runs
+    # `<wrap> -- <command>`. A whole-task wrapper (node-scope) is composed the other way,
+    # outside this process, so it needs nothing here.
+    if args.wrap:
+        child_argv = [*shlex.split(args.wrap), "--", *child_argv]
     return run(args.nproc, args.devices_per_proc, child_argv)
 
 

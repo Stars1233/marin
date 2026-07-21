@@ -719,10 +719,10 @@ def _build_pod_manifest(
     pod_name = _pod_name(task_id, attempt_id)
 
     namespace = config.namespace
-    default_image = config.default_image
-    # Per-task image override (RunTaskRequest.task_image). The init container
-    # keeps default_image since it runs iris's own bundle_fetch tooling.
-    task_image = run_req.task_image or default_image
+    # Per-task image override (RunTaskRequest.task_image) wins; otherwise the
+    # cluster default. GPU tooling (nsys) is baked into the task image, so a GPU
+    # job needs no special image and iris does not inspect the resource request.
+    task_image = run_req.task_image or config.default_image
     cache_dir = config.cache_dir
     service_account = config.service_account
     host_network = config.host_network

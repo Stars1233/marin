@@ -33,8 +33,15 @@ from iris.cluster.constraints import (
     region_constraint,
     zone_constraint,
 )
-from iris.cluster.types import CoschedulingConfig, EnvironmentSpec, ResourceSpec, is_job_finished, tpu_device
+from iris.cluster.types import (
+    CoschedulingConfig,
+    EnvironmentSpec,
+    ResourceSpec,
+    is_job_finished,
+    tpu_device,
+)
 from iris.cluster.types import Entrypoint as IrisEntrypoint
+from iris.hooks.multigpu import build_multigpu_hook
 from iris.rpc import actor_pb2, job_pb2
 from rigging.timing import ExponentialBackoff
 
@@ -143,6 +150,20 @@ def convert_entrypoint(entrypoint: FrayEntrypoint) -> IrisEntrypoint:
         be = entrypoint.binary_entrypoint
         return IrisEntrypoint.from_command(be.command, *be.args)
     raise ValueError("Entrypoint must have either callable_entrypoint or binary_entrypoint")
+
+
+def wrap_multiprocess(entrypoint: IrisEntrypoint, resources: ResourceSpec, processes_per_task: int) -> IrisEntrypoint:
+    """Prepend the multigpu supervisor so each task runs ``processes_per_task`` GPU processes.
+
+    iris runs the entrypoint verbatim, so fray applies the hook here. Requires a GPU
+    device whose count is divisible by ``processes_per_task``.
+    """
+    hook = build_multigpu_hook(resources, processes_per_task)
+    return IrisEntrypoint(
+        command=hook.wrap(entrypoint.command),
+        workdir_files=entrypoint.workdir_files,
+        workdir_file_refs=entrypoint.workdir_file_refs,
+    )
 
 
 def convert_environment(env: EnvironmentConfig | None, device: DeviceConfig | None = None) -> EnvironmentSpec | None:
@@ -587,6 +608,8 @@ class FrayIrisClient:
     def submit(self, request: JobRequest, adopt_existing: bool = True) -> IrisJobHandle:
         iris_resources = convert_resources(request.resources)
         iris_entrypoint = convert_entrypoint(request.entrypoint)
+        if request.processes_per_task > 1:
+            iris_entrypoint = wrap_multiprocess(iris_entrypoint, iris_resources, request.processes_per_task)
         iris_environment = convert_environment(request.environment, request.resources.device)
         iris_constraints = convert_constraints(request.resources)
 
@@ -603,7 +626,6 @@ class FrayIrisClient:
                 constraints=iris_constraints if iris_constraints else None,
                 coscheduling=coscheduling,
                 replicas=replicas,
-                processes_per_task=request.processes_per_task,
                 max_retries_failure=request.max_retries_failure,
                 max_retries_preemption=request.max_retries_preemption,
                 max_task_failures=request.max_task_failures,

@@ -41,8 +41,6 @@ from iris.cluster.constraints import (
     region_constraint,
     zone_constraint,
 )
-from iris.cluster.hooks import TaskHook
-from iris.cluster.hooks.nsys import build_profile_hook, profile_cli_options
 from iris.cluster.platforms.k8s.coreweave_topology import (
     COSCHEDULE_NVLINK_DOMAIN_SLICED,
     NVL72_GPUS_PER_NODE,
@@ -634,7 +632,6 @@ def run_iris_job(
     wait: bool = True,
     job_name: str | None = None,
     replicas: int | None = None,
-    processes_per_task: int = 1,
     max_retries: int = 0,
     timeout: int = 0,
     extras: list[str] | None = None,
@@ -649,7 +646,6 @@ def run_iris_job(
     preemptible: bool | None = None,
     task_image: str | None = None,
     container_profile: str | None = None,
-    profile_hook: TaskHook | None = None,
     credentials: ClientCredentials | None = None,
     submit_argv: list[str] | None = None,
     dashboard_url: str | None = None,
@@ -761,11 +757,9 @@ def run_iris_job(
         terminate_on_exit=terminate_on_exit,
         constraints=constraints or None,
         coscheduling=coscheduling,
-        processes_per_task=processes_per_task,
         user=user,
         priority_band=priority_band,
         container_profile=profile,
-        profile_hook=profile_hook,
         credentials=credentials,
         submit_argv=submit_argv,
         dashboard_url=dashboard_url,
@@ -789,11 +783,9 @@ def _submit_and_wait_job(
     terminate_on_exit: bool = True,
     constraints: list[Constraint] | None = None,
     coscheduling: CoschedulingConfig | None = None,
-    processes_per_task: int = 1,
     user: str | None = None,
     priority_band: job_pb2.PriorityBand = job_pb2.PRIORITY_BAND_UNSPECIFIED,
     container_profile: job_pb2.ContainerProfile = job_pb2.CONTAINER_PROFILE_UNSPECIFIED,
-    profile_hook: TaskHook | None = None,
     credentials: ClientCredentials | None = None,
     submit_argv: list[str] | None = None,
     dashboard_url: str | None = None,
@@ -816,12 +808,10 @@ def _submit_and_wait_job(
             extras=extras or [],
             setup_scripts=setup_scripts,
             sync_packages=sync_packages or [],
-            profile=profile_hook,
         ),
         constraints=constraints,
         coscheduling=coscheduling,
         replicas=replicas,
-        processes_per_task=processes_per_task,
         max_retries_failure=max_retries,
         max_task_failures=max_retries,
         timeout=Duration.from_seconds(timeout) if timeout else None,
@@ -938,12 +928,6 @@ Examples:
 @click.option(
     "--replicas", type=int, default=None, help="Number of tasks for gang scheduling (auto-detected for multinode TPUs)"
 )
-@click.option(
-    "--processes-per-task",
-    type=int,
-    default=1,
-    help="GPU processes to run inside each task (default 1). >1 fans each task into N JAX processes per GPU group.",
-)
 @click.option("--max-retries", type=int, default=0, help="Max retries on failure (default: 0)")
 @click.option("--timeout", type=int, default=0, show_default=True, help="Job timeout in seconds (0 = no timeout)")
 @click.option("--region", multiple=True, help="Restrict to region(s) (e.g., --region us-central2). Can be repeated.")
@@ -1017,7 +1001,6 @@ Examples:
         "the container; DOCKER_ACCESS and PRIVILEGED are elevated and require admin."
     ),
 )
-@profile_cli_options
 @click.option(
     "--terminate-on-exit/--no-terminate-on-exit",
     default=True,
@@ -1038,7 +1021,6 @@ def run(
     job_name: str | None,
     user: str | None,
     replicas: int | None,
-    processes_per_task: int,
     max_retries: int,
     timeout: int,
     region: tuple[str, ...],
@@ -1052,11 +1034,6 @@ def run(
     preemptible: bool | None,
     task_image: str | None,
     container_profile: str | None,
-    profile: str | None,
-    profile_output: str | None,
-    profile_tasks: str,
-    profile_trace: str,
-    profile_capture_range: bool,
     terminate_on_exit: bool,
     cmd: tuple[str, ...],
 ):
@@ -1072,19 +1049,6 @@ def run(
     command = list(cmd)
     if not command:
         raise click.UsageError("No command provided after --")
-
-    if profile and no_sync:
-        raise click.UsageError("--profile installs its profiler during setup; it cannot be combined with --no-sync.")
-    if profile_output and not profile:
-        raise click.UsageError("--profile-output has no effect without --profile.")
-    # The nsys hook owns its --profile* flags and how to build itself from them.
-    profile_hook: TaskHook | None = build_profile_hook(
-        profile,
-        output_uri=profile_output,
-        tasks=profile_tasks,
-        trace=profile_trace,
-        capture_range=profile_capture_range,
-    )
 
     submit_argv = redact_submit_argv(list(sys.argv))
 
@@ -1115,7 +1079,6 @@ def run(
             job_name=job_name,
             user=user,
             replicas=replicas,
-            processes_per_task=processes_per_task,
             max_retries=max_retries,
             timeout=timeout,
             extras=list(extra),
@@ -1130,7 +1093,6 @@ def run(
             preemptible=preemptible,
             task_image=task_image,
             container_profile=container_profile,
-            profile_hook=profile_hook,
             credentials=ctx.obj.get("credentials"),
             submit_argv=submit_argv,
             dashboard_url=dashboard_url or None,

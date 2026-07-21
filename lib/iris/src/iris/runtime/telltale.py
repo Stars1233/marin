@@ -16,9 +16,9 @@ from starlette.applications import Starlette
 from iris.client.client import IrisContext, get_iris_ctx
 from iris.cluster.client.job_info import JobInfo, get_job_info
 from iris.cluster.endpoints import LOG_SERVER_ENDPOINT_NAME
-from iris.cluster.hooks.multigpu import IRIS_MULTIGPU_PROCESS_INDEX_ENV
 from iris.cluster.platforms.types import find_free_port
 from iris.cluster.types import Namespace
+from iris.hooks.multigpu import IRIS_MULTIGPU_PROCESS_INDEX_ENV
 from iris.managed_thread import get_thread_container
 
 logger = logging.getLogger(__name__)
