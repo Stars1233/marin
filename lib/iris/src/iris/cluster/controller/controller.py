@@ -993,7 +993,6 @@ class Controller:
         each backend reads its own workers, so nothing here is partitioned.
         """
         inputs = _TickInputs()
-        worker_daemon_backends = [bid for bid in self._backend_ids if bid not in self._dispatch_backends]
 
         # Placement-owning backends each drain their own pending dispatch first.
         if run_reconcile:
@@ -1012,9 +1011,10 @@ class Controller:
                 if self._config.peers:
                     inputs.queued_federation = build_queued_candidates(snap)
                     inputs.expired_queued_federation = reads.expired_queued_handoffs(snap, now.epoch_ms())
-            # Execution-timeout finalization is controller-owned and global; it
-            # runs alongside the worker-daemon reconcile.
-            if run_reconcile and scan_timeouts and worker_daemon_backends:
+            # Execution-timeout finalization is global across worker-daemon and
+            # K8s backends. K8s gangs rely on it because they omit
+            # activeDeadlineSeconds.
+            if run_reconcile and scan_timeouts:
                 inputs.timeout_rows = reads.scan_execution_timeout_rows(snap)
         return inputs
 

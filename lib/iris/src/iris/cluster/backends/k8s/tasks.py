@@ -931,12 +931,9 @@ def _build_pod_manifest(
         spec["hostNetwork"] = True
         spec["dnsPolicy"] = "ClusterFirstWithHostNet"
 
-    # Skip activeDeadlineSeconds for gangs only: k8s counts it from pod creation,
-    # including time a gang spends SchedulingGated while it waits for the autoscaler
-    # to provision every node, so a large gang could hit DeadlineExceeded before it
-    # ever runs. Single pods admit quickly and, on a K8s-only cluster, this is their
-    # only timeout enforcement (the controller's execution-timeout scan runs only for
-    # worker-daemon backends), so they keep the deadline.
+    # K8s starts activeDeadlineSeconds at pod creation, so omit it for gangs that
+    # may wait SchedulingGated while nodes provision. The controller times gangs
+    # from execution start; single pods keep the earlier native deadline.
     if run_req.HasField("timeout") and run_req.timeout.milliseconds > 0 and not is_gang:
         spec["activeDeadlineSeconds"] = max(1, run_req.timeout.milliseconds // 1000)
 
