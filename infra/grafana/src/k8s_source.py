@@ -61,6 +61,20 @@ _GPU_RESOURCE = "nvidia.com/gpu"
 _IRIS_TASK_ID_ENV = "IRIS_TASK_ID"
 _TERMINAL_POD_PHASES = frozenset(("Succeeded", "Failed"))
 
+# CoreWeave physical-topology labels a GPU node carries: which rack it lives in,
+# the rack's full CoreWeave-assigned name, and its instance type.
+_RACK_LABEL = "node.coreweave.cloud/rack"
+_RACK_NAME_LABEL = "ds.coreweave.com/physical-topology.rack-name"
+_INSTANCE_TYPE_LABEL = "node.kubernetes.io/instance-type"
+
+# gpu_racks' tray/rack concept — many nodes sharing one liquid-cooled rack, with a
+# fleet-wide expected tray count — is specific to GB200 NVL72. Other instance types
+# (e.g. gd-8xh100ib-i128, a standalone 8-GPU H100 server) get their own CoreWeave
+# rack label too, but mostly 1 node per rack: cw-us-east-02a has 29 racks, 26 of them
+# with exactly one node. Grouping those in made every one read as "1 of 18 trays" and
+# fired the below-16 alert on hardware the threshold was never about.
+_GB200_INSTANCE_TYPE_SUBSTRING = "gb200"
+
 # Container waiting reasons the crashloop rows report.
 BACKOFF_REASONS = ("CrashLoopBackOff", "ImagePullBackOff")
 
@@ -429,6 +443,55 @@ class K8sSource:
         rows.sort(key=lambda row: row["last_seen"] or 0, reverse=True)
         return rows[:_EVENT_LIMIT]
 
+    def gpu_racks(self) -> list[dict]:
+        """One row per physical rack of GB200 nodes: trays registered vs. Ready.
+
+        Scoped to GB200 NVL72 instance types (see _GB200_INSTANCE_TYPE_SUBSTRING):
+        other GPU instance types carry a CoreWeave rack label too, but with a
+        different physical-rack topology the 16/18-tray expectation doesn't apply to.
+
+        Raises:
+            ValueError: A node has a malformed nvidia.com/gpu capacity quantity.
+        """
+        racks: dict[str, dict] = {}
+        for node in self._list("/api/v1/nodes"):
+            if _node_gpu_capacity(node) <= 0:
+                continue
+            labels = (node.get("metadata") or {}).get("labels") or {}
+            instance_type = labels.get(_INSTANCE_TYPE_LABEL, "")
+            if _GB200_INSTANCE_TYPE_SUBSTRING not in instance_type:
+                continue
+            rack = labels.get(_RACK_LABEL)
+            if rack is None:
+                continue
+            bucket = racks.setdefault(
+                rack,
+                {
+                    "rack": rack,
+                    "rack_name": labels.get(_RACK_NAME_LABEL, ""),
+                    "instance_type": instance_type,
+                    "trays_total": 0,
+                    "trays_ready": 0,
+                },
+            )
+            bucket["trays_total"] += 1
+            if _node_ready(node):
+                bucket["trays_ready"] += 1
+        return [racks[rack] for rack in sorted(racks, key=int)]
+
+
+def _node_gpu_capacity(node: dict) -> int:
+    raw = ((node.get("status") or {}).get("capacity") or {}).get(_GPU_RESOURCE, 0)
+    try:
+        return int(raw)
+    except (TypeError, ValueError) as err:
+        raise ValueError(f"invalid {_GPU_RESOURCE} capacity quantity: {raw!r}") from err
+
+
+def _node_ready(node: dict) -> bool:
+    conditions = (node.get("status") or {}).get("conditions") or []
+    return any(c.get("type") == "Ready" and c.get("status") == "True" for c in conditions)
+
 
 def _container_statuses(pod: dict) -> list[dict]:
     status = pod.get("status") or {}
@@ -561,6 +624,27 @@ class K8sFleet:
 
     def warning_events(self) -> list[dict]:
         return self._fan_out(lambda s: s.warning_events(), self._error_row)
+
+    def gpu_racks(self) -> list[dict]:
+        return self._fan_out(lambda s: s.gpu_racks(), self._error_row)
+
+    def alert_gpu_rack_trays(self) -> list[dict]:
+        """Per rack: trays_ready as ``value``, for the below-minimum-trays alert.
+
+        Unlike the other alert routes, an unreachable cluster contributes no rows
+        here rather than an explicit safe value: we don't know its rack set to fill
+        in placeholders for, and a fabricated value below the threshold would
+        double-page alongside K8sClusterUnreachable, which already covers that
+        failure mode. noDataState=Alerting still pages if the whole fleet drops out.
+        """
+
+        def counts(source: K8sSource) -> list[dict]:
+            return [
+                {"rack": row["rack"], "rack_name": row["rack_name"], "value": row["trays_ready"]}
+                for row in source.gpu_racks()
+            ]
+
+        return self._fan_out(counts, lambda err: [])
 
     def health(self) -> list[dict]:
         """One row per cluster: reachable, error class, and API server latency."""

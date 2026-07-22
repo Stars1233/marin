@@ -38,8 +38,10 @@ GET /k8s/control_plane | crashloops | pending     CW control-plane state, all cl
 GET /k8s/termination_candidates | kueue | events | health
                                                     ... one response, `cluster` column
 GET /k8s/overview                                 explicit pending/crashloop counts
+GET /k8s/gpu_racks                                GPU nodes grouped by physical rack: trays total/ready
 GET /k8s/alerts/{unreachable,crashloops,          alert rows: string labels + one
-     webhook_ready,degraded,stuck_gpu_pods}       numeric, >=1 row per cluster
+     webhook_ready,degraded,stuck_gpu_pods,        numeric; gpu_rack_trays omits rows for
+     gpu_rack_trays}                               a cluster it cannot reach, others zero
 GET /health                                       bridge liveness
 ```
 
@@ -88,6 +90,19 @@ CoreWeave's per-node daemons are thousands of pods of someone else's infrastruct
 while the namespaces we operate hold about a hundred. These are current-state reads —
 the bridge stores no history; trends come from the finelog-backed rows.
 
+`gpu_racks` lists every GB200 NVL72 node (`nvidia.com/gpu` capacity present and
+`node.kubernetes.io/instance-type` containing `gb200`), grouped by its CoreWeave
+`node.coreweave.cloud/rack` label, with the rack's full name
+(`ds.coreweave.com/physical-topology.rack-name`), instance type, and how many of
+its trays are registered vs. Ready. The instance-type filter matters: other GPU
+node pools carry a CoreWeave rack label too, but not the 18-node shared-rack
+topology the 16/18 thresholds assume — `cw-us-east-02a`'s H100 fleet
+(`gd-8xh100ib-i128`) has 29 racks, 26 of them a single standalone node, and
+without the filter every one read as "1 of 18 trays." A tray that never
+re-registers with the k8s API — the common failure mode after hardware
+maintenance — is invisible here, so a GB200 rack short of 18 trays is a floor
+on what's down, not a guarantee.
+
 The `/k8s/alerts/*` routes exist for Grafana's table-alert contract: string label
 columns plus exactly one numeric column, and always at least one row per cluster — an
 explicit zero when healthy — so an alert rule can never enter NoData. A cluster the
@@ -117,8 +132,10 @@ src/discovery.py       GCE label -> internal IP
 src/config.py          cluster targets, watched components, and bridge settings
 src/cache.py           TTL cache with in-flight coalescing
 src/errors.py          UpstreamError -> 5xx
+src/dashboard_stitch.py  resolves dashboards/*.json panelRef markers into full panel bodies
 provisioning/          datasources (finelog, iris, github, k8s), dashboards, alerting
-dashboards/            dashboard JSON — reviewed like code
+dashboards/            dashboard JSON source — reviewed like code; see "Adding a dashboard"
+dashboards/panels/     panel bodies shared across dashboards, referenced by panelRef
 marin-infra-panel/     internal React panel for the matrix, CI strip, and W&B charts
 Dockerfile             Grafana + bridge venv + pinned Infinity and internal panel plugins
 entrypoint.sh          runs both; if either dies the container dies
@@ -126,12 +143,23 @@ __main__.py            Pulumi entry point — the Cloud Run service (iac.gcp.clo
 Pulumi.yaml            Pulumi project, run on the shared repo venv
 ```
 
-Dashboards: `infra.json` (the compact cockpit — nightlies, CI and ferries, Iris capacity,
-provisioning, control-plane health, Kubernetes workload state, and hero training), `fleet.json` (canary +
+Dashboards: `home.json` (the landing page — see below), `infra.json` (the compact
+cockpit — nightlies, CI and ferries, Iris capacity, provisioning, control-plane
+health, Kubernetes workload state, and hero training), `fleet.json` (canary +
 worker health), `iris.json`
 (per-task and per-worker resource usage), `pipelines.json` (Zephyr throughput and shard
 memory), `training.json` (levanter training metrics from the `telltale` namespace,
 grouped by run), `k8s.json` (current CW control-plane state from the k8s source).
+
+`home.json` is provisioned as the default home dashboard
+(`GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/etc/grafana/dashboards/home.json`,
+the stitcher's output path) — everyone who opens grafana.oa.dev without a
+specific dashboard in mind lands here instead of Grafana's stock welcome page.
+It leads with a native `alertlist` panel (every rule currently Alerting or
+Pending, across every group), then a row of the same GCP/Iris and CoreWeave
+k8s health stats as `infra.json`'s cockpit, the control-plane components
+table, and the GB200 rack tray inventory — all shared `panelRef` fragments, so
+none of it drifts independently of the dashboards those fragments also serve.
 
 ## Alerting
 
@@ -143,9 +171,11 @@ redeploy.
 
 Rules page only on near-certain incidents: an unreachable cluster, a
 crash-looping watched component, an admission webhook with no ready endpoints, a
-degraded component, a dead Iris controller, and a GPU pod that stays node-bound and
+degraded component, a dead Iris controller, a GPU pod that stays node-bound and
 nonterminal without finalizers for five minutes after the bridge's two-minute
-overdue threshold. The stuck-pod rule groups by node and links the cordon-first
+overdue threshold, and a GB200 rack with fewer than 16 trays Ready for five
+minutes (the NVL72 rack spec is 18; a floor rather than an outright outage —
+see `gpu_racks` above). The stuck-pod rule groups by node and links the cordon-first
 recovery skill; terminal, unbound, and finalizer-held pods stay dashboard-only.
 Other workload-tier signals (gated pods, Kueue backlog, workload crashloops) are
 dashboard-only because they have expected benign causes. `severity=critical` routes to `ops-critical` (email ops@openathena.ai +
@@ -290,3 +320,33 @@ Write the window into the SQL as `{{from}}` / `{{to}}`, and bin the time axis wi
 `date_bin(INTERVAL '${__interval_ms} milliseconds', ts)` so Grafana sizes the
 buckets to the panel — see `dashboards/iris.json`. All dashboards use the
 `${cluster}` datasource variable so one serves marin and marin-dev.
+
+## Sharing a panel across dashboards
+
+A panel that belongs on more than one dashboard (e.g. the k8s workload-issue
+tables that also appear on the `infra.json` cockpit) is a single fragment file
+under `dashboards/panels/<name>.json` — the panel's full body (type, title,
+description, datasource, fieldConfig, options, targets) with `id` and `gridPos`
+omitted, since those two fields are the only ones that legitimately vary by
+placement. Each dashboard references it with a stitch marker instead of the full
+body:
+
+```json
+{ "id": 4, "gridPos": { "h": 8, "w": 24, "x": 0, "y": 7 }, "panelRef": "control_plane_components" }
+```
+
+`src/dashboard_stitch.py` resolves every `panelRef` marker into its fragment body
+at image build time (Dockerfile), the same way the `marin-infra-panel` build above
+resolves TSX into JS — the fragment is the reviewed source, the merged dashboard
+JSON `/etc/grafana/dashboards` ships to the container is derived, not committed.
+`uv run pytest` runs the same resolution before asserting datasource UIDs, filter
+expressions, and stat-panel schemas, so a stitching mistake fails locally, not
+after a deploy. This was the fix for `infra.json`'s k8s panels drifting from the
+bridge's actual field names (`phase`/`count`/`involved_object` that the routes no
+longer return) — a panel shared this way can only go stale in one place.
+
+Deliberately not a Grafana library panel: those live in Grafana's Postgres state,
+not git, and only sync through the Library Elements HTTP API — no file-based
+provisioning exists for them as of Grafana 13.x. A `panelRef` fragment stays
+100% file-provisioned like everything else here, at the cost of only resolving
+at build time rather than being editable through the Grafana UI.

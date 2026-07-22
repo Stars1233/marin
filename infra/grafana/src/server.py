@@ -28,11 +28,13 @@ Routes, grouped by source (cluster is a path segment where it applies):
     GET /k8s/events                              recent Warning events
     GET /k8s/health                              per-cluster API server reachability + latency
     GET /k8s/overview                            explicit workload issue counts (zeros included)
+    GET /k8s/gpu_racks                           GPU nodes grouped by physical rack: trays total/ready
     GET /k8s/alerts/unreachable                  alert rows: cluster, error_class, value(0|1)
     GET /k8s/alerts/crashloops?scope=            alert rows: cluster, scope, value(count)
     GET /k8s/alerts/webhook_ready                alert rows: cluster, webhook, value(ready count)
     GET /k8s/alerts/degraded                     alert rows: cluster, component, value(desired-ready)
     GET /k8s/alerts/stuck_gpu_pods                alert rows: cluster, node, value(count)
+    GET /k8s/alerts/gpu_rack_trays                alert rows: cluster, rack_name, value(trays_ready)
     GET /health                                  bridge liveness
 
 A dead controller or GitHub returns 5xx (not empty rows), and the failure is not
@@ -361,6 +363,9 @@ def create_app(
 
         return k8s_endpoint("overview", compute)
 
+    def k8s_gpu_racks(_: Request) -> JSONResponse:
+        return k8s_endpoint("gpu_racks", k8s_fleet.gpu_racks)
+
     def k8s_alerts_unreachable(_: Request) -> JSONResponse:
         return k8s_endpoint("alerts_unreachable", k8s_fleet.alert_unreachable)
 
@@ -378,6 +383,9 @@ def create_app(
 
     def k8s_alerts_degraded(_: Request) -> JSONResponse:
         return k8s_endpoint("alerts_degraded", k8s_fleet.alert_degraded)
+
+    def k8s_alerts_gpu_rack_trays(_: Request) -> JSONResponse:
+        return k8s_endpoint("alerts_gpu_rack_trays", k8s_fleet.alert_gpu_rack_trays)
 
     def k8s_alerts_stuck_gpu_pods(_: Request) -> JSONResponse:
         # The dashboard and alert projection share one fleet LIST per cache TTL.
@@ -407,10 +415,12 @@ def create_app(
             Route("/k8s/events", k8s_events),
             Route("/k8s/health", k8s_health),
             Route("/k8s/overview", k8s_overview),
+            Route("/k8s/gpu_racks", k8s_gpu_racks),
             Route("/k8s/alerts/unreachable", k8s_alerts_unreachable),
             Route("/k8s/alerts/crashloops", k8s_alerts_crashloops),
             Route("/k8s/alerts/webhook_ready", k8s_alerts_webhook_ready),
             Route("/k8s/alerts/degraded", k8s_alerts_degraded),
+            Route("/k8s/alerts/gpu_rack_trays", k8s_alerts_gpu_rack_trays),
             Route("/k8s/alerts/stuck_gpu_pods", k8s_alerts_stuck_gpu_pods),
         ]
     )

@@ -57,6 +57,30 @@ def pod(
     }
 
 
+def node(
+    name: str,
+    *,
+    rack: str | None = None,
+    rack_name: str = "",
+    instance_type: str = "",
+    gpu_capacity: int = 0,
+    ready: bool = True,
+) -> dict:
+    labels = {}
+    if rack is not None:
+        labels["node.coreweave.cloud/rack"] = rack
+        labels["ds.coreweave.com/physical-topology.rack-name"] = rack_name
+    if instance_type:
+        labels["node.kubernetes.io/instance-type"] = instance_type
+    return {
+        "metadata": {"name": name, "labels": labels},
+        "status": {
+            "capacity": {"nvidia.com/gpu": str(gpu_capacity)},
+            "conditions": [{"type": "Ready", "status": "True" if ready else "False"}],
+        },
+    }
+
+
 def k8s_api(routes: dict):
     """A MockTransport handler serving canned bodies by path.
 
@@ -86,7 +110,7 @@ def make_k8s_source(handler, name: str = "cw-a", token: str | None = "secret") -
 
 
 def healthy_k8s_routes() -> dict:
-    """A cluster where every watched component is up and the webhook has one endpoint."""
+    """A cluster where every watched component is up, the webhook has one endpoint, and one GPU rack is full."""
     return {
         "/version": {"gitVersion": "v1.32.0"},
         KUEUE_DEPLOY: deployment("kueue-system", "kueue-controller-manager"),
@@ -101,4 +125,7 @@ def healthy_k8s_routes() -> dict:
         "/api/v1/namespaces": [],
         "/apis/kueue.x-k8s.io/v1beta2/workloads": [],
         "/api/v1/events": [],
+        "/api/v1/nodes": [
+            node("g1", rack="169", rack_name="dh1-r169-us-east-08a", instance_type="gb200-4x", gpu_capacity=4)
+        ],
     }

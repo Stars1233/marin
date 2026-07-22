@@ -193,22 +193,26 @@ def _rows(path: str, query: str) -> list[dict] | dict:
             {"cluster": cluster, "reachable": True, "up": 1, "latency_ms": 31, "error_class": ""}
             for cluster in ("cw-us-east-02a", "cw-us-east-08a", "cw-rno2a")
         ]
+    if path == "/k8s/alerts/unreachable":
+        return [
+            {"cluster": cluster, "error_class": "none", "value": 0}
+            for cluster in ("cw-us-east-02a", "cw-us-east-08a", "cw-rno2a")
+        ]
     if path == "/k8s/overview":
         return [{"pending_pods": 1, "crashlooping_containers": 1}]
     if path == "/k8s/control_plane":
         return [
             {
                 "cluster": cluster,
-                "kind": "deployment",
-                "namespace": namespace,
-                "name": name,
-                "desired": 1,
+                "kind": "component",
+                "component": component,
                 "ready": 1,
-                "up": 1,
-                "error_class": "",
+                "desired": 1,
+                "restarts": 0,
+                "waiting_reason": "",
             }
             for cluster in ("cw-us-east-02a", "cw-us-east-08a", "cw-rno2a")
-            for namespace, name in (("iris", "iris-controller"), ("kueue-system", "kueue-controller-manager"))
+            for component in ("iris/iris-controller", "kueue-system/kueue-controller-manager")
         ]
     if path == "/k8s/pending":
         return [
@@ -216,11 +220,9 @@ def _rows(path: str, query: str) -> list[dict] | dict:
                 "cluster": "cw-us-east-08a",
                 "namespace": "iris",
                 "pod": "trainer-queued",
-                "phase": "Pending",
+                "state": "pending",
                 "reason": "Unschedulable",
                 "age_seconds": 420,
-                "scope": "workload",
-                "error_class": "",
             }
         ]
     if path == "/k8s/crashloops":
@@ -249,20 +251,42 @@ def _rows(path: str, query: str) -> list[dict] | dict:
             }
         ]
     if path == "/k8s/kueue":
+        return [{"cluster": "cw-us-east-08a", "queue": "training", "unadmitted": 6, "oldest_age_seconds": 540}]
+    if path == "/k8s/gpu_racks":
         return [
-            {"cluster": "cw-us-east-08a", "queue": "training", "count": 6, "oldest_age_seconds": 540, "error_class": ""}
+            {
+                "cluster": "cw-us-east-08a",
+                "rack": rack,
+                "rack_name": f"dh1-r{rack}-us-east-08a",
+                "instance_type": "gb200-4x",
+                "trays_total": total,
+                "trays_ready": ready,
+            }
+            for rack, total, ready in (
+                ("122", 17, 17),
+                ("124", 17, 17),
+                ("125", 17, 17),
+                ("126", 18, 18),
+                ("128", 16, 16),
+                ("129", 18, 18),
+                ("136", 17, 17),
+                ("137", 16, 16),
+                ("392", 16, 16),
+                ("393", 16, 16),
+                ("394", 16, 16),
+                ("397", 15, 15),
+            )
         ]
     if path == "/k8s/events":
         return [
             {
                 "cluster": "cw-us-east-08a",
                 "namespace": "training",
-                "involved_object": "trainer-queued",
+                "object": "Pod/trainer-queued",
                 "reason": "FailedScheduling",
                 "message": "waiting for H100 capacity",
                 "count": 2,
                 "last_seen": round(_NOW.timestamp() * 1000),
-                "error_class": "",
             }
         ]
     if path.startswith("/wandb/"):

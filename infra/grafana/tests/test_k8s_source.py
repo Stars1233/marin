@@ -18,6 +18,7 @@ from conftest import (
     healthy_k8s_routes,
     k8s_api,
     make_k8s_source,
+    node,
     pod,
 )
 from github_source import GithubSource
@@ -328,6 +329,79 @@ def test_terminating_rejects_an_invalid_gpu_quantity():
         make_k8s_source(k8s_api(routes)).termination_candidates()
 
 
+def test_gpu_racks_groups_by_rack_and_counts_ready():
+    routes = {
+        "/api/v1/nodes": [
+            node("g1", rack="169", rack_name="dh1-r169-us-east-08a", instance_type="gb200-4x", gpu_capacity=4),
+            node("g2", rack="169", rack_name="dh1-r169-us-east-08a", instance_type="gb200-4x", gpu_capacity=4),
+            node(
+                "g3", rack="397", rack_name="dh1-r397-us-east-08a", instance_type="gb200-4x", gpu_capacity=4, ready=False
+            ),
+        ]
+    }
+    rows = make_k8s_source(k8s_api(routes)).gpu_racks()
+    assert rows == [
+        {
+            "rack": "169",
+            "rack_name": "dh1-r169-us-east-08a",
+            "instance_type": "gb200-4x",
+            "trays_total": 2,
+            "trays_ready": 2,
+        },
+        {
+            "rack": "397",
+            "rack_name": "dh1-r397-us-east-08a",
+            "instance_type": "gb200-4x",
+            "trays_total": 1,
+            "trays_ready": 0,
+        },
+    ]
+
+
+def test_gpu_racks_excludes_non_gpu_and_unlabeled_nodes():
+    routes = {
+        "/api/v1/nodes": [
+            node("cpu-1", rack="122", instance_type="gb200-4x", gpu_capacity=0),
+            node("no-rack-label", instance_type="gb200-4x", gpu_capacity=4),
+            node("g1", rack="169", instance_type="gb200-4x", gpu_capacity=4),
+        ]
+    }
+    rows = make_k8s_source(k8s_api(routes)).gpu_racks()
+    assert [row["rack"] for row in rows] == ["169"]
+
+
+def test_gpu_racks_excludes_non_gb200_instance_types():
+    # cw-us-east-02a's H100 fleet (gd-8xh100ib-i128) carries a CoreWeave rack label
+    # too, but mostly one node per rack — grouping it in misapplies the GB200
+    # 16/18-tray thresholds to hardware they were never about.
+    routes = {
+        "/api/v1/nodes": [
+            node("h100-1", rack="2", instance_type="gd-8xh100ib-i128", gpu_capacity=8),
+            node("g1", rack="169", instance_type="gb200-4x", gpu_capacity=4),
+        ]
+    }
+    rows = make_k8s_source(k8s_api(routes)).gpu_racks()
+    assert [row["rack"] for row in rows] == ["169"]
+
+
+def test_gpu_racks_sorts_numerically_not_lexically():
+    routes = {
+        "/api/v1/nodes": [
+            node("g1", rack="10", instance_type="gb200-4x", gpu_capacity=4),
+            node("g2", rack="9", instance_type="gb200-4x", gpu_capacity=4),
+        ]
+    }
+    rows = make_k8s_source(k8s_api(routes)).gpu_racks()
+    assert [row["rack"] for row in rows] == ["9", "10"]
+
+
+def test_gpu_racks_rejects_an_invalid_gpu_capacity_quantity():
+    bad_node = node("g1", rack="169", instance_type="gb200-4x", gpu_capacity=4)
+    bad_node["status"]["capacity"][GPU_RESOURCE] = "many"
+    with pytest.raises(ValueError):
+        make_k8s_source(k8s_api({"/api/v1/nodes": [bad_node]})).gpu_racks()
+
+
 # --- K8sFleet ---------------------------------------------------------------
 
 
@@ -347,6 +421,21 @@ def test_fleet_stamps_cluster_and_keeps_healthy_clusters_on_partial_failure():
     (error_row,) = [row for row in rows if row["cluster"] == "cw-b"]
     assert error_row["error_class"] == "auth"
     assert "403" in error_row["error"]
+
+
+def test_alert_gpu_rack_trays_maps_trays_ready_to_value():
+    fleet = _fleet(("cw-a", k8s_api(healthy_k8s_routes())))
+    assert fleet.alert_gpu_rack_trays() == [
+        {"cluster": "cw-a", "rack": "169", "rack_name": "dh1-r169-us-east-08a", "value": 1}
+    ]
+
+
+def test_alert_gpu_rack_trays_omits_rows_for_an_unreachable_cluster():
+    # Unlike the other alert routes, an unreachable cluster contributes no rows: we
+    # don't know its rack set, and a fabricated below-threshold value would double-page
+    # alongside K8sClusterUnreachable.
+    fleet = _fleet(("cw-a", k8s_api(healthy_k8s_routes())), ("cw-b", _forbidden))
+    assert [row["cluster"] for row in fleet.alert_gpu_rack_trays()] == ["cw-a"]
 
 
 def test_alert_routes_return_explicit_zeros_when_healthy():
@@ -435,10 +524,21 @@ def test_k8s_routes_serve_fleet_rows():
         "/k8s/pending",
         "/k8s/kueue",
         "/k8s/events",
+        "/k8s/gpu_racks",
     ):
         assert client.get(path).status_code == 200
     health = client.get("/k8s/health").json()
     assert health[0]["cluster"] == "cw-a" and health[0]["reachable"] is True
+
+    (rack,) = client.get("/k8s/gpu_racks").json()
+    assert rack == {
+        "cluster": "cw-a",
+        "rack": "169",
+        "rack_name": "dh1-r169-us-east-08a",
+        "instance_type": "gb200-4x",
+        "trays_total": 1,
+        "trays_ready": 1,
+    }
 
 
 def test_stuck_termination_routes_return_classification_and_alert_projection():
