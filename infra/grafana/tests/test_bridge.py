@@ -80,7 +80,7 @@ def _client(
     k8s_fleet: K8sFleet | None = None,
     loom_alerts: LoomAlertClient | None = None,
 ) -> TestClient:
-    github = GithubSource(token=None, timeout=5.0)
+    github = GithubSource(auth=None, timeout=5.0)
     return TestClient(
         create_app(
             bridge_config(cache_ttl),

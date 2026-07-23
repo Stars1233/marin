@@ -222,8 +222,11 @@ cannot drift through duplicated configuration.
 
 ## Secrets and rotation
 
-All secrets live in Secret Manager and reach the container as env vars via the
-`CloudRunService` `secrets` field; values never enter Pulumi or git.
+All secrets live in Secret Manager, hand-placed, and reach the container as env
+vars via the `CloudRunService` `secrets` field; the values never enter Pulumi or
+git. The deploy account is fail-closed on secret creation, so the program only
+references secrets — each must exist and be listed in the `infra/permissions`
+allowlist for the deploy account to bind IAM on it.
 
 Loom alert delivery does not add a secret. The bridge authenticates with the
 Cloud Run service account and short-lived Google/Loom tokens, while Pulumi owns
@@ -231,15 +234,18 @@ the identity-to-profile binding.
 
 | Env var | Secret | Feeds |
 |---|---|---|
-| `GITHUB_TOKEN` | `marin-status-page-github-token` | ferry/build/nightly panels |
+| `GITHUB_APP_PRIVATE_KEY` | `marin-grafana-github-app-private-key` | ferry/build/nightly panels |
 | `GF_DATABASE_PASSWORD` | `cloudsql-grafana-password` | Grafana's Postgres state (see Deploy) |
 | `CW_READ_TOKEN` | `marin-grafana-cw-read-token` | k8s source (all CW clusters) |
 | `SLACK_ALERTS_WEBHOOK` | `marin-grafana-slack-webhook` | alert contact points |
 | `GF_SMTP_PASSWORD` | `marin-grafana-smtp-credentials` | Grafana SMTP (email alerts, optional) |
 
-All but the last must exist before a deploy — Cloud Run fails to start a revision
-that references a missing secret. `GF_SMTP_PASSWORD` is optional: `__main__.py`
-probes for the secret and only wires it (and enables SMTP) when it exists.
+`GF_DATABASE_PASSWORD`, `CW_READ_TOKEN`, and `SLACK_ALERTS_WEBHOOK` must exist
+before a deploy — Cloud Run fails to start a revision that references a missing
+secret. `GF_SMTP_PASSWORD` and `GITHUB_APP_PRIVATE_KEY` are optional: `__main__.py`
+probes for each and wires it only when the secret exists (the GitHub App also
+needs its `github_app_client_id` config). Unset, the GitHub panels deploy
+unauthenticated and the build panel shows no data.
 
 `CW_READ_TOKEN` is an org-wide CoreWeave API token minted with only the `read` role
 (CKS binds it to the built-in `view` ClusterRole): read-only kubectl across every
@@ -334,17 +340,30 @@ project-level and shared across the project's IAP services, so nothing per-servi
 configuring beyond the `viewers` list. The service is created IAP-gated with no viewers,
 i.e. reachable by nobody until the first grant.
 
-The ferry and build panels read the GitHub API; `GITHUB_TOKEN` comes from the
-`marin-status-page-github-token` Secret Manager secret, mounted by the CloudRunService
-`secrets` field (the value never enters Pulumi). The name is a holdover from the retired
-`marin-infra-dashboard` status page; Grafana is now its only consumer, so keep it despite
-the name. Create it once if it does not exist — a classic token with no scopes or a
-fine-grained PAT scoped to public-repo read is enough:
+The ferry, build, and nightly panels read the GitHub API, which gates the GraphQL
+build query behind auth even for public repos. The bridge authenticates as the
+"Marin Ops Agent" GitHub App (`src/github_app.py`): it signs a JWT with the app's
+private key, looks up its installation, and mints a read-only token scoped to the
+repos the panels read (the main repo and every nightly lane repo, all under
+`marin-community`), refreshing it before expiry. A static token that expired is
+what blanked the build panel.
+
+The app's client id is committed as `github_app_client_id` (not secret); the
+private key is hand-placed. `__main__.py` wires the app only when both are present,
+so the merge-triggered deploy never blocks. The client id is already set, so
+enabling auth is one step (plus its permissions grant):
 
 ```bash
-echo -n "<paste-github-token>" | gcloud secrets create marin-status-page-github-token \
-  --project=hai-gcp-models --data-file=-
+# Add marin-grafana-github-app-private-key to secret_iam_secrets in
+# infra/permissions/Pulumi.hai-gcp-models.yaml and apply the permissions stack, then:
+gcloud secrets create marin-grafana-github-app-private-key \
+  --project=hai-gcp-models --data-file=key.pem
 ```
+
+Install the app on `marin-community` with access to the main repo and every
+nightly lane repo (`evalchemy`, `harbor`, `MarinSkyRL`, `vllm`, `tpu-inference`),
+read-only on Contents, Metadata, Commit statuses, Checks, and Actions. The minted
+token is attenuated to that subset even if the app holds broader grants.
 
 ## Adding a dashboard
 

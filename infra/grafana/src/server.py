@@ -60,15 +60,25 @@ from datetime import UTC, datetime
 import pyarrow as pa
 import uvicorn
 from cache import TtlCache
-from config import BRIDGE_PORT, CLUSTERS, FINELOG_SLOW_THRESHOLD_MS, K8S_CLUSTERS, BridgeConfig, ClusterTarget
+from config import (
+    BRIDGE_PORT,
+    CLUSTERS,
+    FINELOG_SLOW_THRESHOLD_MS,
+    GITHUB_REPO,
+    K8S_CLUSTERS,
+    BridgeConfig,
+    ClusterTarget,
+)
 from errors import UpstreamError
 from finelog.errors import QueryResultTooLargeError
 from finelog_health import FinelogHealth
 from finelog_source import FinelogSource, MetricSource
+from github_app import GithubAppAuth
 from github_source import GithubSource
 from iris_source import IrisSource
 from k8s_source import K8sFleet, K8sSource
 from loom_alerts import LoomAlertClient, LoomAlertDeliveryError, LoomAlertPayloadError
+from nightly_config import NIGHTLY_LANES
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -523,7 +533,13 @@ def main() -> None:
     config = BridgeConfig.from_environment()
     finelog_sources = {c.name: FinelogSource(c, timeout_ms=config.query_timeout_ms) for c in CLUSTERS}
     iris_sources = {c.name: IrisSource(c, timeout=config.http_timeout) for c in CLUSTERS}
-    github_source = GithubSource(token=config.github_token, timeout=config.http_timeout)
+    if config.github_app_credentials is None:
+        logger.warning("no GitHub App credentials; GitHub panels run unauthenticated and the build panel shows no data")
+    # The shared GitHub client reads the main repo (ferries/builds) and every nightly
+    # lane repo, so the installation token must be scoped to all of them.
+    github_repos = {GITHUB_REPO, *(lane.repository for lane in NIGHTLY_LANES)}
+    github_auth = GithubAppAuth(config.github_app_credentials, github_repos) if config.github_app_credentials else None
+    github_source = GithubSource(auth=github_auth, timeout=config.http_timeout)
     k8s_fleet = K8sFleet([K8sSource(c, token=config.cw_read_token, timeout=config.http_timeout) for c in K8S_CLUSTERS])
     wandb_source = WandbSource(timeout=config.http_timeout)
     loom_alerts = LoomAlertClient(config.loom_alerts) if config.loom_alerts is not None else None
