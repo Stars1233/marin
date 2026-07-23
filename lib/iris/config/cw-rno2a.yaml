@@ -46,6 +46,9 @@ provisioning:
       acme_email: ops@openathena.ai
       cluster_issuers: [letsencrypt-http01-staging, letsencrypt-http01-prod]
       active_cluster_issuer: letsencrypt-http01-prod
+    federation_dns:
+      hostname: iris-cw-rno2a.oa.dev
+      target: iris-cw-rno2a.208261-marin-rn02a.coreweave.app
     rbac: { service_account: iris-controller }
 
 platform:

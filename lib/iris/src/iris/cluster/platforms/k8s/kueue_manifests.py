@@ -59,6 +59,13 @@ CKS_KUEUE_FEATURE_GATES = [
 # build_controller_manager_config for why a broad selector is dangerous.
 DEFAULT_POD_NAMESPACES = ("iris",)
 
+# Kueue's Kubernetes API client is shared by reconcilers, event recording, and
+# leader election. Iris clusters routinely carry enough Pods and Workloads for
+# Kueue's upstream 20-QPS/30-burst defaults to delay a lease renewal during a
+# restart resync.
+DEFAULT_CLIENT_CONNECTION_QPS = 100.0
+DEFAULT_CLIENT_CONNECTION_BURST = 200
+
 # Standard k8s per-node label, the finest topology level.
 _K8S_HOSTNAME_LABEL = "kubernetes.io/hostname"
 
@@ -135,7 +142,12 @@ CPU_FLAVOR_QUOTA = {**NON_BINDING_QUOTA, "nvidia.com/gpu": "0", "rdma/ib": "0"}
 # --------------------------------------------------------------------------
 # Pure builders (return plain dicts; no I/O).
 # --------------------------------------------------------------------------
-def build_controller_manager_config(pod_namespaces: Sequence[str] = DEFAULT_POD_NAMESPACES) -> dict:
+def build_controller_manager_config(
+    pod_namespaces: Sequence[str] = DEFAULT_POD_NAMESPACES,
+    *,
+    client_connection_qps: float = DEFAULT_CLIENT_CONNECTION_QPS,
+    client_connection_burst: int = DEFAULT_CLIENT_CONNECTION_BURST,
+) -> dict:
     """Return the kueue ``Configuration`` (controller-manager config) as a dict.
 
     Serialized to YAML and embedded as the chart's ``controllerManagerConfigYaml``
@@ -159,7 +171,7 @@ def build_controller_manager_config(pod_namespaces: Sequence[str] = DEFAULT_POD_
     it can't reach (no network yet) → the pod is rejected → the node never goes
     Ready. Opt-in scoping keeps the webhooks off every namespace but our own.
     """
-    return {
+    config: dict[str, object] = {
         "apiVersion": "config.kueue.x-k8s.io/v1beta1",
         "kind": "Configuration",
         "health": {"healthProbeBindAddress": ":8081"},
@@ -186,13 +198,20 @@ def build_controller_manager_config(pod_namespaces: Sequence[str] = DEFAULT_POD_
         "integrations": {
             "frameworks": ["batch/job", "pod"],
         },
+        "clientConnection": {
+            "qps": client_connection_qps,
+            "burst": client_connection_burst,
+        },
     }
+    return config
 
 
 def build_cks_values(
     pod_namespaces: Sequence[str] = DEFAULT_POD_NAMESPACES,
     *,
     manager_memory_limit: str | None = None,
+    client_connection_qps: float = DEFAULT_CLIENT_CONNECTION_QPS,
+    client_connection_burst: int = DEFAULT_CLIENT_CONNECTION_BURST,
 ) -> dict:
     """Return the ``cks-kueue`` (CoreWeave) helm values (managerConfig only).
 
@@ -213,7 +232,13 @@ def build_cks_values(
     request/limit instead of duplicating it.
     """
     config_yaml = yaml.safe_dump(
-        build_controller_manager_config(pod_namespaces), default_flow_style=False, sort_keys=False
+        build_controller_manager_config(
+            pod_namespaces,
+            client_connection_qps=client_connection_qps,
+            client_connection_burst=client_connection_burst,
+        ),
+        default_flow_style=False,
+        sort_keys=False,
     )
     controller_manager: dict = {"featureGates": CKS_KUEUE_FEATURE_GATES}
     if manager_memory_limit is not None:

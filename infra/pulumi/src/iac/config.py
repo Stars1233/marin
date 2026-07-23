@@ -19,6 +19,10 @@ from enum import StrEnum
 from typing import Annotated, Literal
 
 from iris.cluster.config import IrisClusterConfig, load_config
+from iris.cluster.platforms.k8s.kueue_manifests import (
+    DEFAULT_CLIENT_CONNECTION_BURST,
+    DEFAULT_CLIENT_CONNECTION_QPS,
+)
 from iris.cluster.platforms.k8s.network_manifests import DEFAULT_CLUSTER_ISSUER
 from pydantic import BaseModel, Field
 from rigging.config_discovery import resolve_cluster_config
@@ -44,14 +48,21 @@ class CksClusterSpec(BaseModel):
     zone: str
 
 
+class KueueClientConnectionSpec(BaseModel):
+    """Kubernetes API client rate limit for the Kueue controller-manager."""
+
+    qps: float = Field(default=DEFAULT_CLIENT_CONNECTION_QPS, gt=0)
+    burst: int = Field(default=DEFAULT_CLIENT_CONNECTION_BURST, gt=0)
+
+
 class KueueProvisioningSpec(BaseModel):
     """Cluster-scoped Kueue objects owned by IaC (KueueAddon).
 
     The ResourceFlavor name and the Topology set are canonical constants in
     iris.cluster.platforms.k8s.kueue_manifests (shared with install_kueue.py so IaC and the
     script render identically), not per-cluster knobs. cluster_queue derives from the Iris
-    config. The flavor→topology binding and the controller-manager memory override are the
-    two things that vary per cluster and live here.
+    config. The flavor→topology binding and controller-manager resource overrides are the
+    cluster-specific values that live here.
     """
 
     # Which topology the ResourceFlavor binds (spec.topologyName). NVL72 clusters bind
@@ -59,6 +70,8 @@ class KueueProvisioningSpec(BaseModel):
     flavor_topology: str = "infiniband"
     # Override controllerManager.manager.resources' memory (requests == limits)
     manager_memory_limit: str | None = None
+    # Override Iris's shared Kueue client-side API rate limit.
+    client_connection: KueueClientConnectionSpec = Field(default_factory=KueueClientConnectionSpec)
 
 
 # Egress addresses of the marin-side controllers that federate into every CoreWeave cluster
@@ -69,6 +82,7 @@ class KueueProvisioningSpec(BaseModel):
 # lib/iris/scripts/install_cw_network.py — keep the two in sync until that script's own copy is
 # deleted (see README.md's "Future work").
 MARIN_FEDERATION_EGRESS_SOURCES = ["34.27.183.11", "35.254.13.19"]
+CLOUDFLARE_OA_DEV_ZONE_ID = "169959d6aafcbfd77764b8efafa3a509"
 
 
 class IngressSpec(BaseModel):
@@ -87,6 +101,14 @@ class IngressSpec(BaseModel):
     federation_allow_sources: list[str] = Field(default_factory=lambda: list(MARIN_FEDERATION_EGRESS_SOURCES))
 
 
+class FederationDnsSpec(BaseModel):
+    """Cloudflare CNAME for the CoreWeave federation ingress."""
+
+    zone_id: str = CLOUDFLARE_OA_DEV_ZONE_ID
+    hostname: str
+    target: str
+
+
 class RbacSpec(BaseModel):
     """Controller RBAC ceded from ensure_rbac(). namespace derives from the Iris config."""
 
@@ -97,6 +119,7 @@ class CoreweaveProvisioning(BaseModel):
     cluster: CksClusterSpec
     kueue: KueueProvisioningSpec
     ingress: IngressSpec
+    federation_dns: FederationDnsSpec | None = None
     rbac: RbacSpec = RbacSpec()
 
 
