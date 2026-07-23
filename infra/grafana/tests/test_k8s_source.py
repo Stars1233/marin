@@ -459,6 +459,76 @@ def test_finelog_health_reports_missing_deployment():
     )
 
 
+def test_finelog_pods_reports_runtime_resources_probes_and_pvc():
+    manifest = deployment("iris", "finelog-cw-a", containers=("finelog",))
+    container = manifest["spec"]["template"]["spec"]["containers"][0]
+    container.update(
+        {
+            "image": "ghcr.io/marin-community/finelog@sha256:abc",
+            "resources": {
+                "requests": {"cpu": "2", "memory": "16Gi"},
+                "limits": {"cpu": "8", "memory": "32Gi"},
+            },
+            "startupProbe": {"httpGet": {"path": "/health", "port": 10001}},
+            "readinessProbe": {"httpGet": {"path": "/health", "port": 10001}},
+            "livenessProbe": {"httpGet": {"path": "/health", "port": 10001}},
+        }
+    )
+    manifest["spec"]["template"]["spec"]["volumes"] = [
+        {"name": "cache", "persistentVolumeClaim": {"claimName": "finelog-cw-a-cache"}}
+    ]
+    finelog_pod = pod("iris", "finelog-cw-a-abc", restarts=9)
+    finelog_pod["spec"].update({"nodeName": "cpu-1", "containers": [container]})
+    finelog_pod["status"].update(
+        {
+            "phase": "Running",
+            "containerStatuses": [
+                {
+                    "name": "finelog",
+                    "ready": True,
+                    "restartCount": 9,
+                    "state": {"running": {}},
+                    "lastState": {"terminated": {"reason": "Error", "exitCode": 137}},
+                }
+            ],
+        }
+    )
+    routes = {
+        FINELOG_DEPLOYMENTS_PATH: [manifest],
+        "/api/v1/namespaces/iris/pods": [finelog_pod],
+        "/api/v1/namespaces/iris/persistentvolumeclaims/finelog-cw-a-cache": {
+            "spec": {"storageClassName": "shared-vast", "resources": {"requests": {"storage": "250Gi"}}},
+            "status": {"capacity": {"storage": "250Gi"}},
+        },
+    }
+
+    (row,) = make_k8s_source(k8s_api(routes)).finelog_pods()
+
+    assert asdict(row) == {
+        "cluster": "cw-a",
+        "namespace": "iris",
+        "deployment": "finelog-cw-a",
+        "pod": "finelog-cw-a-abc",
+        "node": "cpu-1",
+        "phase": "Running",
+        "ready": True,
+        "restarts": 9,
+        "last_exit_code": 137,
+        "last_exit_reason": "Error",
+        "image": "ghcr.io/marin-community/finelog@sha256:abc",
+        "cpu_request": "2",
+        "cpu_limit": "8",
+        "memory_request": "16Gi",
+        "memory_limit": "32Gi",
+        "startup_probe": True,
+        "readiness_probe": True,
+        "liveness_probe": True,
+        "pvc": "finelog-cw-a-cache",
+        "storage_class": "shared-vast",
+        "storage_capacity": "250Gi",
+    }
+
+
 def test_alert_gpu_rack_trays_maps_trays_ready_to_value():
     fleet = _fleet(("cw-a", k8s_api(healthy_k8s_routes())))
     assert fleet.alert_gpu_rack_trays() == [
@@ -575,6 +645,76 @@ def test_k8s_routes_serve_fleet_rows():
         "trays_total": 1,
         "trays_ready": 1,
     }
+
+
+def test_finelog_route_serializes_pod_diagnostics():
+    routes = healthy_k8s_routes()
+    finelog_pod = pod("iris", "finelog-cw-a-abc", restarts=2)
+    finelog_pod["spec"]["nodeName"] = "cpu-1"
+    finelog_pod["status"]["phase"] = "Running"
+    finelog_pod["status"]["containerStatuses"] = [
+        {
+            "name": "finelog",
+            "ready": True,
+            "restartCount": 2,
+            "state": {"running": {}},
+            "lastState": {"terminated": {"reason": "Error", "exitCode": 137}},
+        }
+    ]
+    routes["/api/v1/namespaces/iris/pods"] = [finelog_pod]
+
+    response = _client(_fleet(("cw-a", k8s_api(routes)))).get("/k8s/finelog")
+
+    assert response.status_code == 200
+    (row,) = response.json()
+    assert {
+        "cluster": row["cluster"],
+        "deployment": row["deployment"],
+        "pod": row["pod"],
+        "node": row["node"],
+        "phase": row["phase"],
+        "ready": row["ready"],
+        "restarts": row["restarts"],
+        "last_exit_code": row["last_exit_code"],
+    } == {
+        "cluster": "cw-a",
+        "deployment": "finelog-cw-a",
+        "pod": "finelog-cw-a-abc",
+        "node": "cpu-1",
+        "phase": "Running",
+        "ready": True,
+        "restarts": 2,
+        "last_exit_code": 137,
+    }
+
+
+def test_finelog_events_route_filters_kubernetes_warnings():
+    routes = healthy_k8s_routes()
+    routes["/api/v1/events"] = [
+        {
+            "involvedObject": {"kind": "Pod", "name": "finelog-cw-a-abc", "namespace": "iris"},
+            "reason": "Unhealthy",
+            "message": "Readiness probe failed",
+            "lastTimestamp": "2026-07-23T02:00:00Z",
+        },
+        {
+            "involvedObject": {"kind": "PersistentVolumeClaim", "name": "cache", "namespace": "iris"},
+            "reason": "ProvisioningFailed",
+            "message": "finelog volume could not be mounted",
+            "lastTimestamp": "2026-07-23T01:59:00Z",
+        },
+        {
+            "involvedObject": {"kind": "Pod", "name": "trainer-0", "namespace": "training"},
+            "reason": "FailedScheduling",
+            "message": "no GPU nodes available",
+            "lastTimestamp": "2026-07-23T01:58:00Z",
+        },
+    ]
+
+    response = _client(_fleet(("cw-a", k8s_api(routes)))).get("/k8s/finelog_events")
+
+    assert response.status_code == 200
+    assert [row["object"] for row in response.json()] == ["Pod/finelog-cw-a-abc", "PersistentVolumeClaim/cache"]
 
 
 def test_stuck_termination_routes_return_classification_and_alert_projection():
