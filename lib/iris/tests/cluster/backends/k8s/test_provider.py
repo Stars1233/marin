@@ -24,6 +24,7 @@ from iris.cluster.backends.k8s.tasks import (
     K8sTaskProvider,
     PeriodicProfiler,
     ResourceCollector,
+    _lookup_pod,
     _pod_name,
     _ProfileTarget,
     _sanitize_label_value,
@@ -288,6 +289,69 @@ def test_sync_pod_not_found_marks_failed(provider, k8s):
     result = provider.sync(batch)
     assert len(result) == 1
     assert result[0].new_state == job_pb2.TASK_STATE_FAILED
+
+
+def test_sync_finds_pod_dispatched_before_pod_names_embedded_uid(provider, k8s):
+    """An in-flight attempt whose pod predates uid-embedded names stays RUNNING.
+
+    Pod names gained the attempt_uid while these pods were already running, and
+    attempt_uid is populated for every attempt, so recomputing only the current
+    name misses them. Reading that miss as a vanished pod fails live tasks on the
+    first controller restart after the upgrade.
+    """
+    task_id = JobName.from_wire("/job/preexisting")
+    entry = RunningTaskEntry(task_id=task_id, attempt_id=0, attempt_uid="a1b2c3d4e5f60718")
+
+    populate_pod(k8s, _pod_name(task_id, 0), "Running")
+
+    batch = make_batch(running_tasks=[entry])
+    for _ in range(_POD_NOT_FOUND_GRACE_CYCLES + 1):
+        result = provider.sync(batch)
+        assert len(result) == 1
+        assert result[0].new_state == job_pb2.TASK_STATE_RUNNING
+
+
+def test_lookup_pod_prefers_uid_name_when_both_are_present(provider, k8s):
+    """With both names in the pod set, the uid-named pod wins.
+
+    Both can be present at once while pre-upgrade pods drain, and only the
+    uid-named one belongs to this attempt.
+    """
+    task_id = JobName.from_wire("/job/resubmitted")
+    uid = "0f1e2d3c4b5a6978"
+    legacy_name = _pod_name(task_id, 0)
+    uid_name = _pod_name(task_id, 0, uid)
+    pods = {legacy_name: {"metadata": {"name": legacy_name}}, uid_name: {"metadata": {"name": uid_name}}}
+
+    name, pod = _lookup_pod(pods, task_id, 0, uid, allow_legacy=True)
+
+    assert name == uid_name
+    assert pod is pods[uid_name]
+
+
+def test_sync_ignores_legacy_pod_for_an_attempt_this_process_dispatched(provider, k8s):
+    """A resubmit does not fall back onto the previous incarnation's uid-less pod.
+
+    A resubmit reuses (task_id, attempt_id) with a fresh uid, so a leftover
+    uid-less pod shares those and outlives the label-based stray reaper. Once
+    this process has dispatched the attempt its pod carries the uid, and treating
+    the leftover as this attempt's pod is the collision #7518 removed.
+    """
+    task_id = JobName.from_wire("/job/resubmitted-after-upgrade")
+    uid = "1122334455667788"
+    populate_pod(k8s, _pod_name(task_id, 0), "Running")  # previous incarnation, still up
+
+    provider.sync(make_batch(tasks_to_run=[make_run_req(task_id.to_wire(), attempt_id=0, attempt_uid=uid)]))
+    k8s.delete(K8sResource.PODS, _pod_name(task_id, 0, uid))  # this attempt's pod goes away
+
+    entry = RunningTaskEntry(task_id=task_id, attempt_id=0, attempt_uid=uid)
+    batch = make_batch(running_tasks=[entry])
+    for _ in range(_POD_NOT_FOUND_GRACE_CYCLES - 1):
+        assert provider.sync(batch)[0].new_state == job_pb2.TASK_STATE_RUNNING
+
+    result = provider.sync(batch)
+    assert result[0].new_state == job_pb2.TASK_STATE_FAILED
+    assert result[0].error == "Pod not found"
 
 
 def test_sync_coscheduled_pod_not_found_is_worker_failed(provider, k8s):
