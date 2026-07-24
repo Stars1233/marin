@@ -148,6 +148,16 @@ already provisioned:
     --role="roles/cloudkms.cryptoKeyEncrypterDecrypter"
   ```
 
+## CI preview
+
+`.github/workflows/ops-iac-preview.yaml` posts `pulumi preview` for every stack as a PR comment.
+**CI never runs `pulumi up`** — see `spec.md §9`. It authenticates as
+`pulumi-ci@hai-gcp-models.iam.gserviceaccount.com`, granted preview-only (decrypt/read, never
+write) access in [`infra/permissions`](../permissions/README.md).
+
+Adapting this to another Pulumi project means a new thin workflow that triggers on that
+project's paths and calls `./.github/actions/pulumi-preview` with its own `stack`/`work-dir`.
+
 ## Unsupported
 
 - **Signing keys** (`iris-<cluster>-signing-key`, `finelog-<cluster>-signing-key`) stay manual,
